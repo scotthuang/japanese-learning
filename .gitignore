@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# 日志文件（不提交，避免敏感信息）
+*.log
+logs/
+
+# 临时文件
+*.tmp
+*.swp
+*.swo
+*~
+
+# OS 文件
+.DS_Store
+.idea/
+.vscode/
+
+# 数据文件（可选：如果希望版本管理数据，可以注释掉）
+# 如果希望跟踪数据变化，删除下面几行
+*.json
+!SKILL.md
+!PROJECT.md
+!IMPLEMENTATION.md
+!scripts/*.py
+!configs/*.json
