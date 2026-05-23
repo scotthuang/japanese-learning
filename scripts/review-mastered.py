@@ -64,7 +64,6 @@ def main():
                 mastered_list.append(info)
     
     if not mastered_list:
-
         if filter_row:
             print(f"📖 在 {filter_row} 中还没有掌握任何假名")
         else:
@@ -86,7 +85,7 @@ def main():
             items = by_row[row_name]
             print(f"【{row_name}】")
             for item in items:
-                print(f"  {item['hiragana']} ({item['katakana']}) - {item['romaji']}  {item['mnemonic']}")
+                print(f"  {item['hiragana']} ({item['katakana']}) → {item['romaji']}  {item['mnemonic']}")
             print()
     
     elif mode == "quiz":
@@ -97,7 +96,7 @@ def main():
         # 显示假名，让用户回忆
         for i, item in enumerate(mastered_list[:10], 1):  # 最多显示10个
             print(f"Q{i}: {item['hiragana']} ({item['katakana']})")
-            print(f"   回忆：罗马音 + 助记 = ?\n")
+            print(f"   回忆：罗马音 = ?  助记 = ?\n")
         
         print("💡 答案：")
         for i, item in enumerate(mastered_list[:10], 1):
@@ -113,6 +112,8 @@ def main():
         print(f"   罗马音：{item['romaji']}")
         print(f"   助记：{item['mnemonic']}")
         print(f"   所属：{item['row']}")
+        # 同时显示片假名对照
+        print(f"\n💡 提示：片假名是 {item['katakana']}，读作 {item['romaji']}")
     
     else:
         print(f"错误：未知模式 '{mode}'", file=sys.stderr)
