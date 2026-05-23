@@ -189,7 +189,18 @@ def main():
     hira_list = [k["hiragana"] for k in card_kana]
     kata_list = [k["katakana"] for k in card_kana]
     roma_list = [k["romaji"] for k in card_kana]
-    mnem_list = [k["mnemonic"] for k in card_kana]
+    
+    # 给助记词加上罗马音
+    import re
+    mnem_list = []
+    for k in card_kana:
+        mnemonic = k["mnemonic"]
+        match = re.match(r'([ぁ-んァ-ヶー]+)（([^）]+)）', mnemonic)
+        if match:
+            kana_part = match.group(1)
+            meaning = match.group(2)
+            mnemonic = f"{kana_part}（{kana_part}={meaning}, {k['romaji']}{meaning}）"
+        mnem_list.append(mnemonic)
     
     log(f"卡片假名: {hira_list}", log_file)
     log(f"新学假名: {[k['hiragana'] for k in selected_new]}", log_file)
@@ -248,6 +259,15 @@ def main():
         kat = k["katakana"]
         r = k["romaji"]
         
+        # 给助记词加上罗马音
+        mnemonic_with_romaji = k["mnemonic"]
+        import re
+        match = re.match(r'([ぁ-んァ-ヶー]+)（([^）]+)）', k["mnemonic"])
+        if match:
+            kana_part = match.group(1)
+            meaning = match.group(2)
+            mnemonic_with_romaji = f"{kana_part}（{kana_part}={meaning}, {r}{meaning}）"
+        
         question_id = f"q_{datetime.now():%Y%m%d}_{len(selected_new)+i+1:03d}"
         
         q_type = random.choice(["hira2kata", "kata2hira", "roma2hira", "roma2kata"])
@@ -278,7 +298,7 @@ def main():
             "kana": h,
             "kanaKata": kat,
             "romaji": r,
-            "mnemonic": k["mnemonic"],
+            "mnemonic": mnemonic_with_romaji,  # 带罗马音的助记
             "isReview": True,
             "q": q_text,
             "options": options,
