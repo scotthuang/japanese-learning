@@ -116,8 +116,12 @@ def llm_parse_full_message(full_message, config, today_data, log_file):
     {{
       "questionId": "题目ID（如 q_20260523_001）",
       "question": "题目文本",
-      "kana": "对应的五十音平假名",
+      "kanaHira": "对应的五十音平假名",
+      "kanaKata": "对应的五十音片假名",
+      "romaji": "对应的罗马音",
       "userAnswer": "用户选择的答案字母（A/B/C）",
+      "userAnswerKana": "用户选择的假名（从选项中提取，如 ア）",
+      "userAnswerRomaji": "用户选择假名的罗马音",
       "correctAnswer": "正确答案字母（A/B/C）",
       "isCorrect": true
     }}
@@ -133,6 +137,8 @@ def llm_parse_full_message(full_message, config, today_data, log_file):
 3. questionResults 数组长度必须等于题目数量
 4. accuracy 是百分比（如 66.67 表示 66.67%），不是小数
 5. 只输出 JSON，不要任何多余文字
+6. userAnswerKana 和 userAnswerRomaji 必须从用户选择的选项中提取假名和罗马音
+7. 如果选项是假名（如 ア (a)），提取假名部分（如 ア）并查找对应的罗马音
 """
 
     api_key = config["api"]["api_key"]
@@ -184,19 +190,55 @@ def llm_parse_full_message(full_message, config, today_data, log_file):
         raise
 
 
-def format_output(parsed):
+def format_output(parsed, today_data=None):
     """格式化输出结果"""
     results = parsed.get("questionResults", [])
     correct_count = parsed.get("correctCount", 0)
     accuracy = parsed.get("accuracy", 0)
 
+    # 构建 questionId -> question 详情的映射
+    qid_to_question = {}
+    if today_data:
+        for q in today_data.get("questions", []):
+            qid = q.get("id", "")
+            if qid:
+                qid_to_question[qid] = q
+
     lines = []
     for i, r in enumerate(results):
         q_num = i + 1
+        q_id = r.get("questionId", "")
+        # 从 today_data 查找题目详情
+        q_detail = qid_to_question.get(q_id, {})
+        kanaHira = r.get("kanaHira", "") or q_detail.get("kana", "")
+        kanaKata = r.get("kanaKata", "") or q_detail.get("kanaKata", "")
+        romaji = r.get("romaji", "") or q_detail.get("romaji", "")
+
         if r.get("isCorrect"):
-            lines.append(f"Q{q_num} ✅")
+            lines.append(f"Q{q_num} 题目：{kanaHira} ({romaji}) / {kanaKata} ({romaji}) ✅")
         else:
-            lines.append(f"Q{q_num} ❌ (正确答案: {r.get('correctAnswer', '?')})")
+            user_answer_kana = r.get("userAnswerKana", "")
+            user_answer_romaji = r.get("userAnswerRomaji", "")
+            # 查找正确答案的假名和罗马音
+            correct_answer_letter = r.get("correctAnswer", "")
+            correct_kana = ""
+            correct_romaji = ""
+            options = q_detail.get("options", [])
+            if correct_answer_letter and options:
+                try:
+                    idx = ord(correct_answer_letter.upper()) - ord("A")
+                    if 0 <= idx < len(options):
+                        opt = options[idx]
+                        # 从选项提取假名和罗马音，格式如 "ア (a)"
+                        match = re.match(r"([^\s]+)\s*\(([^)]+)\)", opt)
+                        if match:
+                            correct_kana = match.group(1)
+                            correct_romaji = match.group(2)
+                except Exception:
+                    pass
+            lines.append(f"Q{q_num} 题目：{kanaHira} ({romaji}) / {kanaKata} ({romaji})")
+            lines.append(f"  你的答案：{user_answer_kana} ({user_answer_romaji}) ❌")
+            lines.append(f"  正确答案：{correct_kana} ({correct_romaji}) ✅")
 
     lines.append("")
     lines.append(f"📊 今日正确率: {accuracy:.2f}% ({correct_count}/{len(results)})")
@@ -331,7 +373,7 @@ def main():
     log("===== 处理完成 =====", log_file)
 
     # 输出结果
-    output = format_output(parsed)
+    output = format_output(parsed, today_data)
     print(output)
 
 

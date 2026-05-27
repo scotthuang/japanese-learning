@@ -135,12 +135,15 @@ def main():
     all_hira = []
     all_kata = []
     all_roma = []
+    romaji_map = {}  # 罗马音查找表：假名 -> 罗马音
     for row in kana_data["rows"]:
         for k in row["kana"]:
             all_kana.append(k)
             all_hira.append(k["hiragana"])
             all_kata.append(k["katakana"])
             all_roma.append(k["romaji"])
+            romaji_map[k["hiragana"]] = k["romaji"]
+            romaji_map[k["katakana"]] = k["romaji"]
     
     # 未掌握的假名（新学）
     new_kana = [k for k in all_kana if k["hiragana"] not in mastered]
@@ -214,32 +217,41 @@ def main():
         h = k["hiragana"]
         kat = k["katakana"]
         r = k["romaji"]
-        
+
         question_id = f"q_{datetime.now():%Y%m%d}_{i+1:03d}"
-        
+
         q_type = random.choice(["hira2kata", "kata2hira", "roma2hira", "roma2kata"])
-        
+
         if q_type == "hira2kata":
             correct = kat
             distractors = random.sample([x["katakana"] for x in all_kana if x["katakana"] != kat], 2)
-            q_text = f"【提问】平假名「{h}」的片假名是？"
+            q_text = f"【提问】平假名「{h} ({r})」的片假名是？"
+            # 选项加罗马音
+            options_raw = distractors + [correct]
+            options = [f"{opt} ({romaji_map[opt]})" for opt in options_raw]
         elif q_type == "kata2hira":
             correct = h
             distractors = random.sample([x["hiragana"] for x in all_kana if x["hiragana"] != h], 2)
-            q_text = f"【提问】片假名「{kat}」的平假名是？"
+            q_text = f"【提问】片假名「{kat} ({r})」的平假名是？"
+            options_raw = distractors + [correct]
+            options = [f"{opt} ({romaji_map[opt]})" for opt in options_raw]
         elif q_type == "roma2hira":
             correct = h
             distractors = random.sample([x["hiragana"] for x in all_kana if x["hiragana"] != h], 2)
             q_text = f"【提问】读音「{r}」对应的平假名是？"
+            options_raw = distractors + [correct]
+            options = [f"{opt} ({romaji_map[opt]})" for opt in options_raw]
         else:  # roma2kata
             correct = kat
             distractors = random.sample([x["katakana"] for x in all_kana if x["katakana"] != kat], 2)
             q_text = f"【提问】读音「{r}」对应的片假名是？"
-        
-        options = distractors + [correct]
+            options_raw = distractors + [correct]
+            options = [f"{opt} ({romaji_map[opt]})" for opt in options_raw]
+
         random.shuffle(options)
-        answer_letter = ["A", "B", "C"][options.index(correct)]
-        
+        # 注意：answer_letter 需要基于原始假名（未加罗马音）来查找
+        answer_letter = ["A", "B", "C"][options.index(f"{correct} ({romaji_map[correct]})")]
+
         questions.append({
             "id": question_id,
             "kana": h,
@@ -284,6 +296,8 @@ def main():
             correct = h
             distractors = random.sample([x["hiragana"] for x in all_kana if x["hiragana"] != h], 2)
             q_text = f"【提问】读音「{r}」对应的平假名是？"
+            options_raw = distractors + [correct]
+            options = [f"{opt} ({romaji_map[opt]})" for opt in options_raw]
         else:  # roma2kata
             correct = kat
             distractors = random.sample([x["katakana"] for x in all_kana if x["katakana"] != kat], 2)
