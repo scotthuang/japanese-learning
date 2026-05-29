@@ -202,7 +202,8 @@ def main():
         if match:
             kana_part = match.group(1)
             meaning = match.group(2)
-            mnemonic = f"{kana_part}（{kana_part}={meaning}, {k['romaji']}{meaning}）"
+            word_romaji = k.get('word_romaji', k['romaji'])
+            mnemonic = f"{kana_part}（{kana_part}={meaning}, {word_romaji}{meaning}）"
         mnem_list.append(mnemonic)
     
     log(f"卡片假名: {hira_list}", log_file)
@@ -226,31 +227,31 @@ def main():
             correct = kat
             distractors = random.sample([x["katakana"] for x in all_kana if x["katakana"] != kat], 2)
             q_text = f"【提问】平假名「{h} ({r})」的片假名是？"
-            # 选项加罗马音
+            # 选项不加罗马音
             options_raw = distractors + [correct]
-            options = [f"{opt} ({romaji_map[opt]})" for opt in options_raw]
+            options = options_raw
         elif q_type == "kata2hira":
             correct = h
             distractors = random.sample([x["hiragana"] for x in all_kana if x["hiragana"] != h], 2)
             q_text = f"【提问】片假名「{kat} ({r})」的平假名是？"
             options_raw = distractors + [correct]
-            options = [f"{opt} ({romaji_map[opt]})" for opt in options_raw]
+            options = options_raw
         elif q_type == "roma2hira":
             correct = h
             distractors = random.sample([x["hiragana"] for x in all_kana if x["hiragana"] != h], 2)
             q_text = f"【提问】读音「{r}」对应的平假名是？"
             options_raw = distractors + [correct]
-            options = [f"{opt} ({romaji_map[opt]})" for opt in options_raw]
+            options = options_raw
         else:  # roma2kata
             correct = kat
             distractors = random.sample([x["katakana"] for x in all_kana if x["katakana"] != kat], 2)
             q_text = f"【提问】读音「{r}」对应的片假名是？"
             options_raw = distractors + [correct]
-            options = [f"{opt} ({romaji_map[opt]})" for opt in options_raw]
+            options = options_raw
 
         random.shuffle(options)
-        # 注意：answer_letter 需要基于原始假名（未加罗马音）来查找
-        answer_letter = ["A", "B", "C"][options.index(f"{correct} ({romaji_map[correct]})")]
+        # answer_letter 基于原始假名查找
+        answer_letter = ["A", "B", "C"][options.index(correct)]
 
         questions.append({
             "id": question_id,
@@ -278,7 +279,8 @@ def main():
         if match:
             kana_part = match.group(1)
             meaning = match.group(2)
-            mnemonic_with_romaji = f"{kana_part}（{kana_part}={meaning}, {r}{meaning}）"
+            word_romaji = k.get('word_romaji', r)
+            mnemonic_with_romaji = f"{kana_part}（{kana_part}={meaning}, {word_romaji}{meaning}）"
         
         question_id = f"q_{datetime.now():%Y%m%d}_{len(selected_new)+i+1:03d}"
         

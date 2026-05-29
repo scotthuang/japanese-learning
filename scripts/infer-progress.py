@@ -339,6 +339,8 @@ def main():
         print("❌ 未找到 progress.json")
         sys.exit(1)
     
+    from datetime import timedelta
+
     # 4. 获取所有假名信息
     all_kana = get_all_kana(config)
     print(f"✅ 已加载 {len(all_kana)} 个假名信息")
@@ -347,7 +349,36 @@ def main():
     print("正在分析每日答题详情...")
     kana_stats = analyze_daily_records(daily_dir, all_kana)
     print(f"✅ 已分析 {len([k for k, v in kana_stats.items() if v['attempts'] > 0])} 个考过的假名")
+
+    # 5.5 生成已学假名复习列表（用于每日摘要）
+    mastered_kana = progress.get('mastered', [])
+    mastered_kana_list = []
     
+    # 读取 kana-data.json
+    kana_data_file = os.path.expanduser(config["workspace"]["kana_data"])
+    with open(kana_data_file, "r", encoding="utf-8") as f:
+        kana_data = json.load(f)
+    
+    # 构建假名信息查找表
+    kana_info_map = {}
+    for row in kana_data["rows"]:
+        for k in row["kana"]:
+            kana_info_map[k["hiragana"]] = k
+    
+    for i, hira in enumerate(mastered_kana):
+        if hira in kana_info_map:
+            info = kana_info_map[hira]
+            word_romaji = info.get('word_romaji', info['romaji'])
+            # 从 mnemonic 提取单词和意思，例如：さくら（樱花）
+            mnemonic = info['mnemonic']
+            import re
+            match = re.match(r'([ぁ-んァ-ヶー]+)（([^）]+)）', mnemonic)
+            if match:
+                word_display = f"{match.group(1)}（{match.group(2)}, {word_romaji}{match.group(2)}）"
+            else:
+                word_display = mnemonic
+            mastered_kana_list.append(f"{i+1}. {hira} ({info['romaji']}) - {info['katakana']} - 单词：{word_display}")
+
     # 6. 生成 learning-profile.md
     print("正在生成学习档案...")
     profile_content, new_kana, review_kana = generate_learning_profile(progress, kana_stats, all_kana, daily_dir)
@@ -391,6 +422,20 @@ def main():
     print(f"   推荐新学：{new_kana[:3]}")
     print(f"   推荐复习：{review_kana[:2]}")
     
+    print(f"\n✅ 每日沉淀完成！已更新学习档案和第二天的学习方案。\n")
+    print("**今日分析摘要：**")
+    analyzed_count = len([k for k, v in kana_stats.items() if v['attempts'] > 0])
+    print(f"- 已分析 {analyzed_count} 个考过的假名")
+    if new_kana:
+        print(f"- 推荐明天学习：{new_kana[0]}（新学）")
+    if review_kana:
+        print(f"- 推荐明天复习：{'、'.join(review_kana[:2])}")
+
+    if mastered_kana_list:
+        print(f"\n**已学假名复习（{len(mastered_kana_list)}个）：**")
+        for line in mastered_kana_list:
+            print(line)
+
     print(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] 全部完成！")
 
 if __name__ == "__main__":
