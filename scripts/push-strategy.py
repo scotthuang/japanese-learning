@@ -9,8 +9,11 @@ import json
 import os
 import sys
 import random
+import re
+import glob
 import subprocess
 from datetime import datetime
+from collections import defaultdict
 
 # 配置文件路径
 CONFIG_FILE = os.path.expanduser("~/.openclaw/workspace/configs/japanese-learning.json")
@@ -98,7 +101,7 @@ def main():
         log("❌ 未找到 progress.json", log_file)
         sys.exit(1)
     
-    # 3.5 读取第二天方案（用于出题）
+    # 3.5 读取第二天方案（仅用于新学假名推荐）
     next_plan_file = os.path.join(workspace, "next-day-plan.json")
     next_plan = {}
     if os.path.isfile(next_plan_file):
@@ -107,6 +110,29 @@ def main():
         log(f"✅ 已加载第二天方案：{next_plan.get('suggestedRow', '无')}", log_file)
     else:
         log("⚠️ 未找到 next-day-plan.json，将使用默认逻辑", log_file)
+
+    # 3.6 从每日档案实时计算每个假名的正确率和上次复习日期
+    kana_stats = {}
+    last_reviewed = defaultdict(lambda: "never")
+    daily_files = sorted(glob.glob(os.path.join(daily_dir, "*.json")))
+    for fpath in daily_files:
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                daily = json.load(f)
+        except Exception:
+            continue
+        date = daily.get("date", "")
+        for q in daily.get("questionResults", []):
+            kana = q.get("kana")
+            if not kana:
+                continue
+            if kana not in kana_stats:
+                kana_stats[kana] = {"attempts": 0, "correct": 0}
+            kana_stats[kana]["attempts"] += 1
+            if q.get("isCorrect"):
+                kana_stats[kana]["correct"] += 1
+            if q.get("isReview") and date > last_reviewed[kana]:
+                last_reviewed[kana] = date
     
     last_push = progress.get("lastPushTime")
     if last_push:
@@ -154,12 +180,10 @@ def main():
         log("所有假名已学完！", log_file)
         sys.exit(0)
     
-    # 从第二天方案读取推荐假名
+    # 从第二天方案读取推荐假名（仅用于新学）
     suggested_new_hira = next_plan.get("quizPlan", {}).get("newKanaForQuiz", [])
-    suggested_review_hira = next_plan.get("quizPlan", {}).get("reviewKanaForQuiz", [])
     
     log(f"方案推荐新学：{suggested_new_hira}", log_file)
-    log(f"方案推荐复习：{suggested_review_hira}", log_file)
     
     # 选择新学假名（优先用方案推荐的）
     selected_new = [k for k in new_kana if k["hiragana"] in suggested_new_hira]
@@ -170,14 +194,63 @@ def main():
         selected_new += remaining[:3 - len(selected_new)]
     selected_new = selected_new[:3]
     
-    # 选择复习假名（用方案推荐的）
-    selected_review = [k for k in review_kana if k["hiragana"] in suggested_review_hira]
-    if len(selected_review) < 2:
-        # 不足2个，从所有已掌握中随机补
-        remaining = [k for k in review_kana if k not in selected_review]
-        random.shuffle(remaining)
-        selected_review += remaining[:2 - len(selected_review)]
-    selected_review = selected_review[:2]
+    # ── 选择复习假名（实时计算，统一打分）──
+    # 策略：错题加权 + 最久没复习优先 + 每天轮换
+    # 每个假名得分 = 距今天数 + (错题加权50) + 日期种子微调
+    # 得分越高 → 越优先
+    log("开始实时选择复习假名...", log_file)
+    today_date = datetime.now().date()
+    today_seed = datetime.now().strftime("%Y%m%d")
+    rng = random.Random(today_seed)
+    
+    new_hira_set = set(k["hiragana"] for k in selected_new)
+    
+    # 算每个已学假名的分
+    scored = []
+    for k in review_kana:
+        hira = k["hiragana"]
+        if hira in new_hira_set:
+            continue  # 和新学重复，跳过
+        
+        stats = kana_stats.get(hira, {"attempts": 0, "correct": 0})
+        acc = round(stats["correct"] / stats["attempts"] * 100, 1) if stats["attempts"] > 0 else 100.0
+        last = last_reviewed.get(hira, "never")
+        
+        # 基础分：距离上次复习的天数
+        if last == "never":
+            days_ago = 999
+        else:
+            try:
+                last_dt = datetime.strptime(last, "%Y-%m-%d").date()
+                days_ago = (today_date - last_dt).days
+            except:
+                days_ago = 0
+        
+        # 错题加权：正确率 < 60% 的加 50 分
+        error_bonus = 50 if acc < 60 else 0
+        
+        # 种子微调（0 ~ 0.99），让同分的假名每天随机排序
+        shuffle = rng.random()
+        
+        score = days_ago + error_bonus + shuffle
+        scored.append((score, k, acc, last))
+    
+    scored.sort(key=lambda x: -x[0])  # 高分优先
+    
+    log(f"复习假名评分排名（top 10）：", log_file)
+    for s, k, acc, last in scored[:10]:
+        log(f"  {k['hiragana']} score={s:.2f} acc={acc}% last={last}", log_file)
+    
+    # 选前 2 个
+    selected_review = [k for _, k, _, _ in scored[:2]]
+    
+    log(f"复习假名选择详情：", log_file)
+    for k in selected_review:
+        hira = k["hiragana"]
+        stats = kana_stats.get(hira, {"attempts": 0, "correct": 0})
+        acc = round(stats["correct"] / stats["attempts"] * 100, 1) if stats["attempts"] > 0 else "-"
+        last = last_reviewed.get(hira, "never")
+        log(f"  {hira} 正确率={acc}% 上次复习={last}", log_file)
     
     log(f"新学假名（来自方案）：{[k['hiragana'] for k in selected_new]}", log_file)
     log(f"复习假名（来自方案）：{[k['hiragana'] for k in selected_review]}", log_file)

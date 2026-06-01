@@ -375,3 +375,7 @@ python3 ~/.openclaw/workspace/skills/japanese-learning/scripts/verify-config.py
 - ✅ verify-reply.py 大改造（用 LLM 推理）
 - ✅ 今日档案新增 questionResults
 - ✅ LLM 只传话，不判断对错
+
+---
+## 测试行
+这是 Claude Code 写入测试，时间：2026-05-30 02:30
