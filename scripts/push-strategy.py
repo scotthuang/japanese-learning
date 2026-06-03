@@ -123,7 +123,7 @@ def main():
             continue
         date = daily.get("date", "")
         for q in daily.get("questionResults", []):
-            kana = q.get("kana")
+            kana = q.get("kanaHira") or q.get("kana", "")
             if not kana:
                 continue
             if kana not in kana_stats:
@@ -131,8 +131,11 @@ def main():
             kana_stats[kana]["attempts"] += 1
             if q.get("isCorrect"):
                 kana_stats[kana]["correct"] += 1
-            if q.get("isReview") and date > last_reviewed[kana]:
-                last_reviewed[kana] = date
+            is_rev = q.get("isReview", False)
+            if is_rev:
+                last_val = last_reviewed[kana]
+                if last_val == "never" or date > last_val:
+                    last_reviewed[kana] = date
     
     last_push = progress.get("lastPushTime")
     if last_push:

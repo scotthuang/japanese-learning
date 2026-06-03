@@ -309,6 +309,28 @@ def main():
     # 验证解析结果
     results = parsed.get("questionResults", [])
     questions = today_data.get("questions", [])
+    # 构建 questionId -> question 的映射，用于补充 isReview 等字段
+    qid_to_q = {}
+    for q in questions:
+        qid = q.get("id", "")
+        if qid:
+            qid_to_q[qid] = q
+
+    # 补齐 results 缺失的 isReview 字段（从今日题目里取）
+    for r in results:
+        q_id = r.get("questionId", "")
+        if q_id in qid_to_q:
+            q_detail = qid_to_q[q_id]
+            if "isReview" not in r:
+                r["isReview"] = q_detail.get("isReview", False)
+            # 也补齐 kanaHira 如果缺失
+            if not r.get("kanaHira"):
+                r["kanaHira"] = q_detail.get("kana", "")
+            if not r.get("kanaKata"):
+                r["kanaKata"] = q_detail.get("kanaKata", "")
+            if not r.get("romaji"):
+                r["romaji"] = q_detail.get("romaji", "")
+
     if len(results) != len(questions):
         log(f"⚠️ 解析结果数量({len(results)})与题目数量({len(questions)})不匹配", log_file)
         # 尝试补齐
