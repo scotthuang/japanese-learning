@@ -35,11 +35,50 @@ def log(msg, log_file):
         f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [VERIFY] {msg}\n")
 
 
-def get_today_file(config):
-    """根据日期推理今日档案路径"""
+def find_target_file(config, full_message):
+    """
+    智能查找目标档案文件：
+    1. 优先从消息中提取日期（如引用消息的日期）
+    2. 如果无法提取，则查找最近的已推送但未回复的档案
+    3. 如果都找不到，返回今天的档案路径（用于后续判断）
+    """
     daily_dir = os.path.expanduser(config["workspace"]["daily_dir"])
+    
+    # 尝试从消息中提取日期（格式：2026-06-08）
+    date_match = re.search(r'202\d-\d{2}-\d{2}', full_message)
+    if date_match:
+        target_date = date_match.group(0)
+        target_file = os.path.join(daily_dir, f"{target_date}.json")
+        if os.path.isfile(target_file):
+            return target_file, target_date
+    
+    # 尝试从题目ID中提取日期（格式：q_20260608_001）
+    id_match = re.search(r'q_(\d{8})_\d+', full_message)
+    if id_match:
+        date_str = id_match.group(1)
+        target_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+        target_file = os.path.join(daily_dir, f"{target_date}.json")
+        if os.path.isfile(target_file):
+            return target_file, target_date
+    
+    # 查找最近的未回复档案（按文件名倒序）
+    if os.path.isdir(daily_dir):
+        files = sorted([f for f in os.listdir(daily_dir) if f.endswith('.json')], reverse=True)
+        for f in files:
+            file_path = os.path.join(daily_dir, f)
+            try:
+                with open(file_path, 'r', encoding='utf-8') as fp:
+                    data = json.load(fp)
+                    # 如果已推送但未回复，就是目标
+                    if data.get('pushed') and not data.get('replied'):
+                        target_date = f.replace('.json', '')
+                        return file_path, target_date
+            except:
+                continue
+    
+    # 默认返回今天的档案路径
     today = datetime.now().strftime("%Y-%m-%d")
-    return os.path.join(daily_dir, f"{today}.json")
+    return os.path.join(daily_dir, f"{today}.json"), today
 
 
 def call_hunyuan_api(api_key, base_url, model, messages):
@@ -276,22 +315,33 @@ def main():
     log("===== 开始处理用户回复 =====", log_file)
     log(f"收到完整消息（长度: {len(full_message)} 字符）", log_file)
 
-    # 推理今日档案路径
-    today_file = get_today_file(config)
-    log(f"今日档案路径: {today_file}", log_file)
+    # 智能查找目标档案（支持补答历史题目）
+    target_file, target_date = find_target_file(config, full_message)
+    log(f"目标档案: {target_file} (日期: {target_date})", log_file)
 
-    if not os.path.isfile(today_file):
-        log(f"❌ 今日档案不存在: {today_file}", log_file)
-        print("❌ 今日暂无推送题目，请等待推送后再回复")
+    if not os.path.isfile(target_file):
+        log(f"❌ 目标档案不存在: {target_file}", log_file)
+        print("❌ 未找到可回答的题目，请确认是否已推送")
+        sys.exit(1)
+    
+    # 检查是否是"未来"的档案（可能是系统错误）
+    today = datetime.now().strftime("%Y-%m-%d")
+    if target_date > today:
+        log(f"⚠️ 警告：目标日期 {target_date} 晚于今天 {today}", log_file)
+        print(f"⚠️ 题目日期 {target_date} 晚于今天，请确认是否正确")
         sys.exit(1)
 
-    # 读取今日档案
+    # 读取目标档案
     try:
-        with open(today_file, "r", encoding="utf-8") as f:
+        with open(target_file, "r", encoding="utf-8") as f:
             today_data = json.load(f)
     except Exception as e:
-        log(f"❌ 读取今日档案失败: {e}", log_file)
+        log(f"❌ 读取目标档案失败: {e}", log_file)
         sys.exit(1)
+
+    # 记录实际回答的日期
+    today_data["_answeredOn"] = today
+    today_data["_originalDate"] = target_date
 
     if today_data.get("replied"):
         log("今日已回复过，跳过", log_file)
@@ -355,7 +405,7 @@ def main():
         kana = r.get("kana", "?")
         log(f"{q_id}: 用户答={ua} 正确答案={ca} {ic} ({kana})", log_file)
 
-    # 更新今日档案
+    # 更新目标档案
     today_data["userReply"] = parsed.get("userReply", "")
     today_data["questionResults"] = parsed.get("questionResults", [])
     today_data["correctCount"] = parsed.get("correctCount", 0)
@@ -363,10 +413,10 @@ def main():
     today_data["replied"] = True
     today_data["repliedAt"] = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    with open(today_file, "w", encoding="utf-8") as f:
+    with open(target_file, "w", encoding="utf-8") as f:
         json.dump(today_data, f, ensure_ascii=False, indent=2)
 
-    log(f"今日档案已更新: correctCount={today_data['correctCount']}, accuracy={today_data['accuracy']}%, replied=true", log_file)
+    log(f"目标档案已更新: correctCount={today_data['correctCount']}, accuracy={today_data['accuracy']}%, replied=true, answeredOn={target_date}", log_file)
 
     # 更新总体进度（将今日学习的假名加入 mastered 列表）
     progress_file = os.path.expanduser(config["workspace"]["progress_file"])
@@ -396,6 +446,11 @@ def main():
 
     # 输出结果
     output = format_output(parsed, today_data)
+    
+    # 如果答题日期不是今天，添加提示
+    if target_date != today:
+        output = f"📅 回答 {target_date} 的题目\n\n{output}"
+    
     print(output)
 
 

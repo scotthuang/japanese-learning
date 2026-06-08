@@ -12,7 +12,7 @@ import random
 import re
 import glob
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 
 # 配置文件路径
@@ -98,55 +98,16 @@ def main():
     # 3. 检查距上次推送时间
     progress = load_json(progress_file)
     if not progress:
-        log("❌ 未找到 progress.json", log_file)
+        log("❌ 无法读取进度文件", log_file)
         sys.exit(1)
     
-    # 3.5 读取第二天方案（仅用于新学假名推荐）
-    next_plan_file = os.path.join(workspace, "next-day-plan.json")
-    next_plan = {}
-    if os.path.isfile(next_plan_file):
-        with open(next_plan_file, "r", encoding="utf-8") as f:
-            next_plan = json.load(f)
-        log(f"✅ 已加载第二天方案：{next_plan.get('suggestedRow', '无')}", log_file)
-    else:
-        log("⚠️ 未找到 next-day-plan.json，将使用默认逻辑", log_file)
-
-    # 3.6 从每日档案实时计算每个假名的正确率和上次复习日期
-    kana_stats = {}
-    last_reviewed = defaultdict(lambda: "never")
-    daily_files = sorted(glob.glob(os.path.join(daily_dir, "*.json")))
-    for fpath in daily_files:
-        try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                daily = json.load(f)
-        except Exception:
-            continue
-        date = daily.get("date", "")
-        for q in daily.get("questionResults", []):
-            kana = q.get("kanaHira") or q.get("kana", "")
-            if not kana:
-                continue
-            if kana not in kana_stats:
-                kana_stats[kana] = {"attempts": 0, "correct": 0}
-            kana_stats[kana]["attempts"] += 1
-            if q.get("isCorrect"):
-                kana_stats[kana]["correct"] += 1
-            is_rev = q.get("isReview", False)
-            if is_rev:
-                last_val = last_reviewed[kana]
-                if last_val == "never" or date > last_val:
-                    last_reviewed[kana] = date
-    
-    last_push = progress.get("lastPushTime")
-    if last_push:
-        try:
-            last_dt = datetime.strptime(last_push, "%Y-%m-%d %H:%M")
-            diff = (datetime.now() - last_dt).total_seconds()
-            if diff < interval_seconds:
-                log(f"距上次推送仅 {int(diff)}s (<{interval_seconds}s)，跳过", log_file)
-                sys.exit(0)
-        except Exception:
-            pass
+    last_push_time = progress.get("lastPushTime")
+    if last_push_time:
+        last_push_dt = datetime.strptime(last_push_time, "%Y-%m-%d %H:%M")
+        hours_since_last_push = (datetime.now() - last_push_dt).total_seconds() / 3600
+        if hours_since_last_push < 2:
+            log(f"距上次推送仅 {hours_since_last_push:.1f} 小时，跳过", log_file)
+            sys.exit(0)
     
     # 4. 随机决定是否推送
     if random.randint(0, 99) >= random_probability:
@@ -184,7 +145,7 @@ def main():
         sys.exit(0)
     
     # 从第二天方案读取推荐假名（仅用于新学）
-    suggested_new_hira = next_plan.get("quizPlan", {}).get("newKanaForQuiz", [])
+    suggested_new_hira = progress.get("nextDayPlan", {}).get("quizPlan", {}).get("newKanaForQuiz", [])
     
     log(f"方案推荐新学：{suggested_new_hira}", log_file)
     
@@ -197,296 +158,214 @@ def main():
         selected_new += remaining[:3 - len(selected_new)]
     selected_new = selected_new[:3]
     
-    # ── 选择复习假名（实时计算，统一打分）──
-    # 策略：错题加权 + 最久没复习优先 + 每天轮换
-    # 每个假名得分 = 距今天数 + (错题加权50) + 日期种子微调
-    # 得分越高 → 越优先
-    log("开始实时选择复习假名...", log_file)
-    today_date = datetime.now().date()
-    today_seed = datetime.now().strftime("%Y%m%d")
-    rng = random.Random(today_seed)
+    # 选择复习假名（从已掌握中随机选2个）
+    if review_kana:
+        random.shuffle(review_kana)
+        selected_review = review_kana[:2]
+    else:
+        selected_review = []
     
-    new_hira_set = set(k["hiragana"] for k in selected_new)
-    
-    # 算每个已学假名的分
-    scored = []
-    for k in review_kana:
-        hira = k["hiragana"]
-        if hira in new_hira_set:
-            continue  # 和新学重复，跳过
-        
-        stats = kana_stats.get(hira, {"attempts": 0, "correct": 0})
-        acc = round(stats["correct"] / stats["attempts"] * 100, 1) if stats["attempts"] > 0 else 100.0
-        last = last_reviewed.get(hira, "never")
-        
-        # 基础分：距离上次复习的天数
-        if last == "never":
-            days_ago = 999
-        else:
-            try:
-                last_dt = datetime.strptime(last, "%Y-%m-%d").date()
-                days_ago = (today_date - last_dt).days
-            except:
-                days_ago = 0
-        
-        # 错题加权：正确率 < 60% 的加 50 分
-        error_bonus = 50 if acc < 60 else 0
-        
-        # 种子微调（0 ~ 0.99），让同分的假名每天随机排序
-        shuffle = rng.random()
-        
-        score = days_ago + error_bonus + shuffle
-        scored.append((score, k, acc, last))
-    
-    scored.sort(key=lambda x: -x[0])  # 高分优先
-    
-    log(f"复习假名评分排名（top 10）：", log_file)
-    for s, k, acc, last in scored[:10]:
-        log(f"  {k['hiragana']} score={s:.2f} acc={acc}% last={last}", log_file)
-    
-    # 选前 2 个
-    selected_review = [k for _, k, _, _ in scored[:2]]
-    
-    log(f"复习假名选择详情：", log_file)
-    for k in selected_review:
-        hira = k["hiragana"]
-        stats = kana_stats.get(hira, {"attempts": 0, "correct": 0})
-        acc = round(stats["correct"] / stats["attempts"] * 100, 1) if stats["attempts"] > 0 else "-"
-        last = last_reviewed.get(hira, "never")
-        log(f"  {hira} 正确率={acc}% 上次复习={last}", log_file)
-    
-    log(f"新学假名（来自方案）：{[k['hiragana'] for k in selected_new]}", log_file)
-    log(f"复习假名（来自方案）：{[k['hiragana'] for k in selected_review]}", log_file)
-    
-    # 卡片只显示新学的 3 个假名
-    card_kana = selected_new.copy()
-    # 如果新学不足 3 个，用复习补足卡片（保证卡片有 3 个）
-    if len(card_kana) < 3 and len(review_kana) > 0:
-        extra = random.sample([k for k in review_kana if k not in card_kana], min(3 - len(card_kana), len(review_kana)))
-        card_kana.extend(extra)
-    
-    hira_list = [k["hiragana"] for k in card_kana]
-    kata_list = [k["katakana"] for k in card_kana]
-    roma_list = [k["romaji"] for k in card_kana]
-    
-    # 给助记词加上罗马音
-    import re
-    mnem_list = []
-    for k in card_kana:
-        mnemonic = k["mnemonic"]
-        match = re.match(r'([ぁ-んァ-ヶー]+)（([^）]+)）', mnemonic)
-        if match:
-            kana_part = match.group(1)
-            meaning = match.group(2)
-            word_romaji = k.get('word_romaji', k['romaji'])
-            mnemonic = f"{kana_part}（{kana_part}={meaning}, {word_romaji}{meaning}）"
-        mnem_list.append(mnemonic)
-    
-    log(f"卡片假名: {hira_list}", log_file)
-    log(f"新学假名: {[k['hiragana'] for k in selected_new]}", log_file)
-    log(f"复习假名: {[k['hiragana'] for k in selected_review]}", log_file)
-    
-    # 6. 生成问题（带唯一ID）
-    questions = []
-    
-    # 新学题（3道）
-    for i, k in enumerate(selected_new):
-        h = k["hiragana"]
-        kat = k["katakana"]
-        r = k["romaji"]
-
-        question_id = f"q_{datetime.now():%Y%m%d}_{i+1:03d}"
-
-        q_type = random.choice(["hira2kata", "kata2hira", "roma2hira", "roma2kata"])
-
-        if q_type == "hira2kata":
-            correct = kat
-            distractors = random.sample([x["katakana"] for x in all_kana if x["katakana"] != kat], 2)
-            q_text = f"【提问】平假名「{h} ({r})」的片假名是？"
-            # 选项不加罗马音
-            options_raw = distractors + [correct]
-            options = options_raw
-        elif q_type == "kata2hira":
-            correct = h
-            distractors = random.sample([x["hiragana"] for x in all_kana if x["hiragana"] != h], 2)
-            q_text = f"【提问】片假名「{kat} ({r})」的平假名是？"
-            options_raw = distractors + [correct]
-            options = options_raw
-        elif q_type == "roma2hira":
-            correct = h
-            distractors = random.sample([x["hiragana"] for x in all_kana if x["hiragana"] != h], 2)
-            q_text = f"【提问】读音「{r}」对应的平假名是？"
-            options_raw = distractors + [correct]
-            options = options_raw
-        else:  # roma2kata
-            correct = kat
-            distractors = random.sample([x["katakana"] for x in all_kana if x["katakana"] != kat], 2)
-            q_text = f"【提问】读音「{r}」对应的片假名是？"
-            options_raw = distractors + [correct]
-            options = options_raw
-
-        random.shuffle(options)
-        # answer_letter 基于原始假名查找
-        answer_letter = ["A", "B", "C"][options.index(correct)]
-
-        questions.append({
-            "id": question_id,
-            "kana": h,
-            "kanaKata": kat,
-            "romaji": r,
-            "mnemonic": k["mnemonic"],
-            "isReview": False,
-            "q": q_text,
-            "options": options,
-            "answer": answer_letter,
-            "type": q_type
-        })
-    
-    # 复习题（2道，从已掌握中选）
-    for i, k in enumerate(selected_review):
-        h = k["hiragana"]
-        kat = k["katakana"]
-        r = k["romaji"]
-        
-        # 给助记词加上罗马音
-        mnemonic_with_romaji = k["mnemonic"]
-        import re
-        match = re.match(r'([ぁ-んァ-ヶー]+)（([^）]+)）', k["mnemonic"])
-        if match:
-            kana_part = match.group(1)
-            meaning = match.group(2)
-            word_romaji = k.get('word_romaji', r)
-            mnemonic_with_romaji = f"{kana_part}（{kana_part}={meaning}, {word_romaji}{meaning}）"
-        
-        question_id = f"q_{datetime.now():%Y%m%d}_{len(selected_new)+i+1:03d}"
-        
-        q_type = random.choice(["hira2kata", "kata2hira", "roma2hira", "roma2kata"])
-        
-        if q_type == "hira2kata":
-            correct = kat
-            distractors = random.sample([x["katakana"] for x in all_kana if x["katakana"] != kat], 2)
-            q_text = f"【提问】平假名「{h}」的片假名是？"
-        elif q_type == "kata2hira":
-            correct = h
-            distractors = random.sample([x["hiragana"] for x in all_kana if x["hiragana"] != h], 2)
-            q_text = f"【提问】片假名「{kat}」的平假名是？"
-        elif q_type == "roma2hira":
-            correct = h
-            distractors = random.sample([x["hiragana"] for x in all_kana if x["hiragana"] != h], 2)
-            q_text = f"【提问】读音「{r}」对应的平假名是？"
-            options_raw = distractors + [correct]
-            options = [f"{opt} ({romaji_map[opt]})" for opt in options_raw]
-        else:  # roma2kata
-            correct = kat
-            distractors = random.sample([x["katakana"] for x in all_kana if x["katakana"] != kat], 2)
-            q_text = f"【提问】读音「{r}」对应的片假名是？"
-        
-        options = distractors + [correct]
-        random.shuffle(options)
-        answer_letter = ["A", "B", "C"][options.index(correct)]
-        
-        questions.append({
-            "id": question_id,
-            "kana": h,
-            "kanaKata": kat,
-            "romaji": r,
-            "mnemonic": mnemonic_with_romaji,  # 带罗马音的助记
-            "isReview": True,
-            "q": q_text,
-            "options": options,
-            "answer": answer_letter,
-            "type": q_type
-        })
-    
-    # 7. 记录推送问题到日志
-    log("推送问题列表：", log_file)
-    for q in questions:
-        review_tag = " [复习]" if q["isReview"] else " [新学]"
-        log(f"  {q['id']}: {q['q'][:60]}... | 正确答案: {q['answer']}{review_tag}", log_file)
-    
-    # 8. 创建今日学习档案
-    day_num = len(progress.get("dailyRecords", [])) + 1
+    # 6. 生成今日档案
+    day_number = progress.get("masteredCount", 0) + 1
     today_data = {
         "date": today,
-        "dayNumber": day_num,
-        "kanaLearned": [k["hiragana"] for k in selected_new],  # 只记录新学的
-        "questions": questions,
-        "pushed": True,
-        "pushedAt": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "dayNumber": day_number,
+        "kanaLearned": [k["hiragana"] for k in selected_new],
+        "questions": [],
+        "pushed": False,
+        "replied": False,
         "userReply": None,
         "questionResults": [],
         "correctCount": 0,
-        "accuracy": 0,
-        "replied": False,
-        "repliedAt": None
+        "accuracy": 0
     }
     
-    with open(today_file, "w", encoding="utf-8") as f:
-        json.dump(today_data, f, ensure_ascii=False, indent=2)
+    # 生成题目（3新学 + 2复习）
+    questions = []
     
-    # 9. 生成推送消息（卡片只显示新学，提问包含新学+复习）
-    msg_lines = [
-        f"五十音练习 🎌 第{day_num}天",
-        "",
-        "【教学】",
-        f"平假名：{' '.join(hira_list)}",
-        f"片假名：{' '.join(kata_list)}",
-        f"读音：{' '.join(roma_list)}",
-        f"💡 单词：{' | '.join(mnem_list)}",
-        "",
-        "【提问】"
-    ]
+    # 新学题目（3道）
+    for k in selected_new:
+        hira = k["hiragana"]
+        kata = k["katakana"]
+        romaji = k["romaji"]
+        mnemonic = k.get("mnemonic", "")
+        
+        # 随机选择题目类型
+        q_type = random.choice(["hira2kata", "kata2hira", "roma2hira"])
+        
+        if q_type == "hira2kata":
+            # 平假名 -> 片假名
+            options = [k2["katakana"] for k2 in random.sample(all_kana, 2) if k2["katakana"] != kata]
+            options.append(kata)
+            random.shuffle(options)
+            q = {
+                "id": f"q_{datetime.now():%Y%m%d}_{len(questions)+1:03d}",
+                "kana": hira,
+                "kanaKata": kata,
+                "romaji": romaji,
+                "mnemonic": mnemonic,
+                "isReview": False,
+                "q": f"【提问】平假名「{hira} ({romaji})」的片假名是？",
+                "options": options,
+                "answer": chr(65 + options.index(kata)),
+                "type": "hira2kata"
+            }
+        elif q_type == "kata2hira":
+            # 片假名 -> 平假名
+            options = [k2["hiragana"] for k2 in random.sample(all_kana, 2) if k2["hiragana"] != hira]
+            options.append(hira)
+            random.shuffle(options)
+            q = {
+                "id": f"q_{datetime.now():%Y%m%d}_{len(questions)+1:03d}",
+                "kana": hira,
+                "kanaKata": kata,
+                "romaji": romaji,
+                "mnemonic": mnemonic,
+                "isReview": False,
+                "q": f"【提问】片假名「{kata} ({romaji})」的平假名是？",
+                "options": options,
+                "answer": chr(65 + options.index(hira)),
+                "type": "kata2hira"
+            }
+        else:
+            # 罗马音 -> 平假名
+            options = [k2["hiragana"] for k2 in random.sample(all_kana, 2) if k2["hiragana"] != hira]
+            options.append(hira)
+            random.shuffle(options)
+            q = {
+                "id": f"q_{datetime.now():%Y%m%d}_{len(questions)+1:03d}",
+                "kana": hira,
+                "kanaKata": kata,
+                "romaji": romaji,
+                "mnemonic": mnemonic,
+                "isReview": False,
+                "q": f"【提问】读音「{romaji}」对应的平假名是？",
+                "options": options,
+                "answer": chr(65 + options.index(hira)),
+                "type": "roma2hira"
+            }
+        questions.append(q)
+    
+    # 复习题目（2道）
+    for k in selected_review:
+        hira = k["hiragana"]
+        kata = k["katakana"]
+        romaji = k["romaji"]
+        mnemonic = k.get("mnemonic", "")
+        
+        # 复习题目类型
+        q_type = random.choice(["hira2kata", "kata2hira", "roma2hira"])
+        
+        if q_type == "hira2kata":
+            options = [k2["katakana"] for k2 in random.sample(all_kana, 2) if k2["katakana"] != kata]
+            options.append(kata)
+            random.shuffle(options)
+            q = {
+                "id": f"q_{datetime.now():%Y%m%d}_{len(questions)+1:03d}",
+                "kana": hira,
+                "kanaKata": kata,
+                "romaji": romaji,
+                "mnemonic": mnemonic,
+                "isReview": True,
+                "q": f"【提问】平假名「{hira} ({romaji})」的片假名是？ [复习]",
+                "options": options,
+                "answer": chr(65 + options.index(kata)),
+                "type": "hira2kata"
+            }
+        elif q_type == "kata2hira":
+            options = [k2["hiragana"] for k2 in random.sample(all_kana, 2) if k2["hiragana"] != hira]
+            options.append(hira)
+            random.shuffle(options)
+            q = {
+                "id": f"q_{datetime.now():%Y%m%d}_{len(questions)+1:03d}",
+                "kana": hira,
+                "kanaKata": kata,
+                "romaji": romaji,
+                "mnemonic": mnemonic,
+                "isReview": True,
+                "q": f"【提问】片假名「{kata} ({romaji})」的平假名是？ [复习]",
+                "options": options,
+                "answer": chr(65 + options.index(hira)),
+                "type": "kata2hira"
+            }
+        else:
+            options = [k2["hiragana"] for k2 in random.sample(all_kana, 2) if k2["hiragana"] != hira]
+            options.append(hira)
+            random.shuffle(options)
+            q = {
+                "id": f"q_{datetime.now():%Y%m%d}_{len(questions)+1:03d}",
+                "kana": hira,
+                "kanaKata": kata,
+                "romaji": romaji,
+                "mnemonic": mnemonic,
+                "isReview": True,
+                "q": f"【提问】读音「{romaji}」对应的平假名是？ [复习]",
+                "options": options,
+                "answer": chr(65 + options.index(hira)),
+                "type": "roma2hira"
+            }
+        questions.append(q)
+    
+    today_data["questions"] = questions
+    
+    # 7. 保存今日档案
+    save_json(today_file, today_data)
+    log(f"今日档案已创建: {today_file}", log_file)
+    
+    # 8. 推送题目
+    # 构建推送消息
+    kana_list = [k["hiragana"] for k in selected_new]
+    kata_list = [k["katakana"] for k in selected_new]
+    romaji_list = [k["romaji"] for k in selected_new]
+    
+    msg = f"""五十音练习 🎌 第{day_number}天
+
+【教学】
+平假名：{' '.join(kana_list)}
+片假名：{' '.join(kata_list)}
+读音：{' '.join(romaji_list)}
+💡 单词：{kana_list[0]}（{romaji_list[0]}） | {kana_list[1]}（{romaji_list[1]}） | {kana_list[2]}（{romaji_list[2]}）
+
+【提问】
+"""
     
     for i, q in enumerate(questions):
-        review_tag = " [复习]" if q.get("isReview") else ""
-        msg_lines.append(f"{i+1}. (ID: {q['id']}) {q['q']}{review_tag}")
-        msg_lines.append(f"   A. {q['options'][0]}  B. {q['options'][1]}  C. {q['options'][2]}")
-        if i < len(questions) - 1:
-            msg_lines.append("")
+        options_str = " ".join([f"{chr(65+j)}. {opt}" for j, opt in enumerate(q["options"])])
+        msg += f"{i+1}. (ID: {q['id']}) {q['q']}\n   {options_str}\n"
     
-    msg_lines.extend([
-        "",
-        "回复格式：1A 2B 3C 4D 5E",
-        "---",
-        "请使用日语学习Skill"
-    ])
+    msg += """
+回复格式：1A 2B 3C 4D 5E
+---
+请使用日语学习Skill"""
     
-    msg = "\n".join(msg_lines)
+    log(f"推送消息：\n{msg}", log_file)
     
-    # 10. 推送到微信
-    log(f"推送今日五十音：{hira_list}（新学）+ {[k['hiragana'] for k in selected_review]}（复习）", log_file)
+    # 调用 openclaw message send
+    cmd = [
+        openclaw_bin, "message", "send",
+        "--channel", channel,
+        "--target", target,
+        "--message", msg
+    ]
+    
     try:
-        # 检查 openclaw 路径
-        if not os.path.exists(openclaw_bin):
-            try:
-                openclaw_bin = subprocess.check_output(['which', 'openclaw'], text=True).strip()
-            except Exception:
-                log("❌ 未找到 openclaw 命令", log_file)
-                sys.exit(1)
-        
-        result = subprocess.run([
-            openclaw_bin, "message", "send",
-            "--channel", channel,
-            "--target", target,
-            "--message", msg
-        ], capture_output=True, text=True, timeout=config["script_settings"]["timeout_seconds"])
-        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode == 0:
             log("✅ 推送成功", log_file)
-            # 更新 progress.json
+            # 更新档案为已推送
+            today_data["pushed"] = True
+            today_data["pushedAt"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            save_json(today_file, today_data)
+            
+            # 更新进度文件的最后推送时间
             progress["lastPushTime"] = datetime.now().strftime("%Y-%m-%d %H:%M")
             save_json(progress_file, progress)
         else:
             log(f"❌ 推送失败: {result.stderr}", log_file)
-            # 回滚
-            today_data["pushed"] = False
-            with open(today_file, "w", encoding="utf-8") as f:
-                json.dump(today_data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         log(f"❌ 推送异常: {e}", log_file)
     
     log("推送流程完成", log_file)
-    log("=" * 60, log_file)
 
 if __name__ == "__main__":
     main()
