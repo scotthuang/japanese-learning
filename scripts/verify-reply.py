@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-验证用户回复，更新今日档案（大改造版）
+验证用户回复，更新今日档案（多窗口适配版）
 用法：verify-reply.py --full-message "完整消息字符串"
 - 只接收 --full-message 参数
 - 用 LLM 推理解析完整消息（不用正则）
-- 更新 daily/*.json 的 questionResults 等字段
+- 匹配回复到正确的窗口（morning/afternoon/evening）
+- 更新 daily/*.json 中对应窗口的 questionResults 等字段
+- 向后兼容旧格式（扁平 pushed/replied）
 读取配置文件：~/.openclaw/workspace/configs/japanese-learning.json
 """
 
@@ -31,36 +33,55 @@ def load_config():
 
 def log(msg, log_file):
     """写日志"""
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
     with open(log_file, "a", encoding="utf-8") as f:
         f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [VERIFY] {msg}\n")
 
 
-def find_target_file(config, full_message):
+def is_new_format(data):
+    """检测是否为多窗口新格式"""
+    return "windows" in data
+
+
+def find_target_file_and_window(config, full_message):
     """
-    智能查找目标档案文件：
-    1. 优先从消息中提取日期（如引用消息的日期）
-    2. 如果无法提取，则查找最近的已推送但未回复的档案
-    3. 如果都找不到，返回今天的档案路径（用于后续判断）
+    智能查找目标档案文件和窗口：
+    1. 从消息中提取日期（如引用消息的日期）
+    2. 从题目ID中提取日期和窗口（格式：q_20260608_morning_001 或 q_20260608_001）
+    3. 查找最近的未回复档案
+    4. 返回 (target_file, target_date, window_name)
+       其中 window_name 可能为 None（旧格式或无法确定）
     """
     daily_dir = os.path.expanduser(config["workspace"]["daily_dir"])
-    
+    target_window = None
+
+    # 尝试从题目ID中提取日期和窗口（新格式：q_20260608_morning_001）
+    id_match = re.search(r'q_(\d{8})_(\w+)_\d+', full_message)
+    if id_match:
+        date_str = id_match.group(1)
+        target_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+        target_window = id_match.group(2)
+        target_file = os.path.join(daily_dir, f"{target_date}.json")
+        if os.path.isfile(target_file):
+            return target_file, target_date, target_window
+
+    # 尝试从题目ID中提取日期（旧格式：q_20260608_001，无窗口名）
+    id_match = re.search(r'q_(\d{8})_(\d+)', full_message)
+    if id_match:
+        date_str = id_match.group(1)
+        target_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+        target_file = os.path.join(daily_dir, f"{target_date}.json")
+        if os.path.isfile(target_file):
+            return target_file, target_date, target_window
+
     # 尝试从消息中提取日期（格式：2026-06-08）
     date_match = re.search(r'202\d-\d{2}-\d{2}', full_message)
     if date_match:
         target_date = date_match.group(0)
         target_file = os.path.join(daily_dir, f"{target_date}.json")
         if os.path.isfile(target_file):
-            return target_file, target_date
-    
-    # 尝试从题目ID中提取日期（格式：q_20260608_001）
-    id_match = re.search(r'q_(\d{8})_\d+', full_message)
-    if id_match:
-        date_str = id_match.group(1)
-        target_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
-        target_file = os.path.join(daily_dir, f"{target_date}.json")
-        if os.path.isfile(target_file):
-            return target_file, target_date
-    
+            return target_file, target_date, target_window
+
     # 查找最近的未回复档案（按文件名倒序）
     if os.path.isdir(daily_dir):
         files = sorted([f for f in os.listdir(daily_dir) if f.endswith('.json')], reverse=True)
@@ -69,16 +90,47 @@ def find_target_file(config, full_message):
             try:
                 with open(file_path, 'r', encoding='utf-8') as fp:
                     data = json.load(fp)
-                    # 如果已推送但未回复，就是目标
-                    if data.get('pushed') and not data.get('replied'):
-                        target_date = f.replace('.json', '')
-                        return file_path, target_date
+                    target_date = f.replace('.json', '')
+
+                    if is_new_format(data):
+                        # 新格式：查找有未回复窗口的文件
+                        windows = data.get("windows", {})
+                        for w_name in ["morning", "afternoon", "evening"]:
+                            w = windows.get(w_name, {})
+                            if w.get("pushed") and not w.get("replied"):
+                                return file_path, target_date, w_name
+                    else:
+                        # 旧格式
+                        if data.get('pushed') and not data.get('replied'):
+                            return file_path, target_date, None
             except:
                 continue
-    
+
     # 默认返回今天的档案路径
     today = datetime.now().strftime("%Y-%m-%d")
-    return os.path.join(daily_dir, f"{today}.json"), today
+    return os.path.join(daily_dir, f"{today}.json"), today, target_window
+
+
+def get_questions_for_verify(today_data, window_name):
+    """
+    获取用于验证的题目列表。
+    - 新格式：返回指定窗口的题目（如果指定了窗口），否则返回所有窗口的题目
+    - 旧格式：返回顶层 questions
+    """
+    if is_new_format(today_data):
+        if window_name:
+            win = today_data.get("windows", {}).get(window_name, {})
+            return win.get("questions", []), window_name
+        else:
+            # 未指定窗口，收集所有窗口的题目
+            all_qs = []
+            windows = today_data.get("windows", {})
+            for w_name in ["morning", "afternoon", "evening"]:
+                w = windows.get(w_name, {})
+                all_qs.extend(w.get("questions", []))
+            return all_qs, None
+    else:
+        return today_data.get("questions", []), None
 
 
 def call_hunyuan_api(api_key, base_url, model, messages):
@@ -114,12 +166,12 @@ def call_hunyuan_api(api_key, base_url, model, messages):
         raise RuntimeError(f"API 调用失败: {e}")
 
 
-def llm_parse_full_message(full_message, config, today_data, log_file):
+def llm_parse_full_message(full_message, config, questions, log_file):
     """用 LLM 推理解析完整消息"""
 
     # 构造题目信息供 LLM 参考
     questions_info = ""
-    for i, q in enumerate(today_data.get("questions", [])):
+    for i, q in enumerate(questions):
         q_id = q.get("id", f"q_unknown_{i+1:03d}")
         q_text = q.get("q", "")
         options = q.get("options", [])
@@ -142,7 +194,7 @@ def llm_parse_full_message(full_message, config, today_data, log_file):
 {full_message}
 ```
 
-以下是今日推送的题目信息（供你参考）：
+以下是本次推送的题目信息（供你参考）：
 
 {questions_info}
 
@@ -229,7 +281,25 @@ def llm_parse_full_message(full_message, config, today_data, log_file):
         raise
 
 
-def format_output(parsed, today_data=None):
+def match_reply_to_window(today_data, parsed_question_ids):
+    """
+    根据解析出的题目ID，确定回复属于哪个窗口。
+    返回窗口名称，或 None（旧格式 / 无法确定）。
+    """
+    if not is_new_format(today_data):
+        return None
+
+    windows = today_data.get("windows", {})
+    for w_name in ["morning", "afternoon", "evening"]:
+        w = windows.get(w_name, {})
+        w_q_ids = {q.get("id") for q in w.get("questions", [])}
+        if w_q_ids.intersection(parsed_question_ids):
+            return w_name
+
+    return None
+
+
+def format_output(parsed, questions):
     """格式化输出结果"""
     results = parsed.get("questionResults", [])
     correct_count = parsed.get("correctCount", 0)
@@ -237,17 +307,16 @@ def format_output(parsed, today_data=None):
 
     # 构建 questionId -> question 详情的映射
     qid_to_question = {}
-    if today_data:
-        for q in today_data.get("questions", []):
-            qid = q.get("id", "")
-            if qid:
-                qid_to_question[qid] = q
+    for q in questions:
+        qid = q.get("id", "")
+        if qid:
+            qid_to_question[qid] = q
 
     lines = []
     for i, r in enumerate(results):
         q_num = i + 1
         q_id = r.get("questionId", "")
-        # 从 today_data 查找题目详情
+        # 从 question 列表查找题目详情
         q_detail = qid_to_question.get(q_id, {})
         kanaHira = r.get("kanaHira", "") or q_detail.get("kana", "")
         kanaKata = r.get("kanaKata", "") or q_detail.get("kanaKata", "")
@@ -280,7 +349,7 @@ def format_output(parsed, today_data=None):
             lines.append(f"  正确答案：{correct_kana} ({correct_romaji}) ✅")
 
     lines.append("")
-    lines.append(f"📊 今日正确率: {accuracy:.2f}% ({correct_count}/{len(results)})")
+    lines.append(f"📊 本次正确率: {accuracy:.2f}% ({correct_count}/{len(results)})")
 
     if correct_count == len(results):
         lines.append("🎉 全对！太棒了！")
@@ -294,8 +363,74 @@ def format_output(parsed, today_data=None):
     return "\n".join(lines)
 
 
+def update_window_data(today_data, window_name, parsed):
+    """更新指定窗口的回复数据"""
+    if is_new_format(today_data) and window_name:
+        win = today_data["windows"].get(window_name, {})
+        win["userReply"] = parsed.get("userReply", "")
+        win["questionResults"] = parsed.get("questionResults", [])
+        win["correctCount"] = parsed.get("correctCount", 0)
+        win["accuracy"] = parsed.get("accuracy", 0)
+        win["replied"] = True
+        win["repliedAt"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    else:
+        # 旧格式：直接更新顶层
+        today_data["userReply"] = parsed.get("userReply", "")
+        today_data["questionResults"] = parsed.get("questionResults", [])
+        today_data["correctCount"] = parsed.get("correctCount", 0)
+        today_data["accuracy"] = parsed.get("accuracy", 0)
+        today_data["replied"] = True
+        today_data["repliedAt"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # 更新总计数据（新格式）
+    if is_new_format(today_data):
+        total_correct = 0
+        total_questions = 0
+        for w_name in ["morning", "afternoon", "evening"]:
+            w = today_data["windows"].get(w_name, {})
+            total_correct += w.get("correctCount", 0)
+            total_questions += len(w.get("questionResults", []))
+        today_data["totalCorrectCount"] = total_correct
+        today_data["totalAccuracy"] = round(total_correct / total_questions * 100, 2) if total_questions > 0 else 0
+
+
+def update_mastered_progress(today_data, config, log_file):
+    """根据所有窗口的答题结果更新总体进度"""
+    progress_file = os.path.expanduser(config["workspace"]["progress_file"])
+    try:
+        with open(progress_file, "r", encoding="utf-8") as f:
+            progress = json.load(f)
+
+        # 收集所有窗口的题目
+        all_questions = []
+        if is_new_format(today_data):
+            for w_name in ["morning", "afternoon", "evening"]:
+                w = today_data["windows"].get(w_name, {})
+                all_questions.extend(w.get("questions", []))
+        else:
+            all_questions = today_data.get("questions", [])
+
+        # 添加今日学习的假名到 mastered（去重）
+        for q in all_questions:
+            kana = q.get("kana", "")
+            if kana and kana not in progress.get("mastered", []):
+                if "mastered" not in progress:
+                    progress["mastered"] = []
+                progress["mastered"].append(kana)
+
+        progress["masteredCount"] = len(progress["mastered"])
+        progress["lastUpdateTime"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        with open(progress_file, "w", encoding="utf-8") as f:
+            json.dump(progress, f, ensure_ascii=False, indent=2)
+
+        log(f"总体进度已更新: masteredCount={progress['masteredCount']}", log_file)
+    except Exception as e:
+        log(f"⚠️ 更新总体进度失败: {e}", log_file)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="日语学习答案验证（LLM推理版）")
+    parser = argparse.ArgumentParser(description="日语学习答案验证（多窗口LLM推理版）")
     parser.add_argument("--full-message", required=True,
                         help="完整消息字符串（用户回复 + 引用的原始推送消息）")
     args = parser.parse_args()
@@ -315,16 +450,16 @@ def main():
     log("===== 开始处理用户回复 =====", log_file)
     log(f"收到完整消息（长度: {len(full_message)} 字符）", log_file)
 
-    # 智能查找目标档案（支持补答历史题目）
-    target_file, target_date = find_target_file(config, full_message)
-    log(f"目标档案: {target_file} (日期: {target_date})", log_file)
+    # 智能查找目标档案和窗口
+    target_file, target_date, window_name = find_target_file_and_window(config, full_message)
+    log(f"目标档案: {target_file} (日期: {target_date}, 窗口: {window_name or '未确定/旧格式'})", log_file)
 
     if not os.path.isfile(target_file):
         log(f"❌ 目标档案不存在: {target_file}", log_file)
         print("❌ 未找到可回答的题目，请确认是否已推送")
         sys.exit(1)
-    
-    # 检查是否是"未来"的档案（可能是系统错误）
+
+    # 检查是否是"未来"的档案
     today = datetime.now().strftime("%Y-%m-%d")
     if target_date > today:
         log(f"⚠️ 警告：目标日期 {target_date} 晚于今天 {today}", log_file)
@@ -343,14 +478,41 @@ def main():
     today_data["_answeredOn"] = today
     today_data["_originalDate"] = target_date
 
-    if today_data.get("replied"):
+    # 获取用于验证的题目列表
+    questions, matched_window = get_questions_for_verify(today_data, window_name)
+
+    # 如果未确定窗口，尝试从题目ID匹配
+    if not matched_window and is_new_format(today_data):
+        # 从消息中提取所有题目ID
+        qid_pattern = re.findall(r'q_\d{8}_\w+_\d+', full_message)
+        if not qid_pattern:
+            qid_pattern = re.findall(r'q_\d{8}_\d+', full_message)
+        if qid_pattern:
+            matched_window = match_reply_to_window(today_data, set(qid_pattern))
+            if matched_window:
+                log(f"通过题目ID匹配到窗口: {matched_window}", log_file)
+                questions, _ = get_questions_for_verify(today_data, matched_window)
+
+    # 检查是否已回复（新格式：检查对应窗口；旧格式：检查顶层）
+    if is_new_format(today_data) and matched_window:
+        win = today_data.get("windows", {}).get(matched_window, {})
+        if win.get("replied"):
+            log(f"窗口 [{matched_window}] 已回复过，跳过", log_file)
+            print(f"ℹ️ {matched_window} 窗口已回复过，等待下次推送")
+            sys.exit(0)
+    elif not is_new_format(today_data) and today_data.get("replied"):
         log("今日已回复过，跳过", log_file)
         print("ℹ️ 今日已回复过，等待下次推送")
         sys.exit(0)
 
+    if not questions:
+        log("❌ 未找到题目列表", log_file)
+        print("❌ 未找到可回答的题目")
+        sys.exit(1)
+
     # 用 LLM 推理解析完整消息
     try:
-        parsed = llm_parse_full_message(full_message, config, today_data, log_file)
+        parsed = llm_parse_full_message(full_message, config, questions, log_file)
     except Exception as e:
         log(f"❌ LLM 推理失败: {e}", log_file)
         print(f"❌ 答案解析失败，请稍后重试或联系管理员")
@@ -358,22 +520,21 @@ def main():
 
     # 验证解析结果
     results = parsed.get("questionResults", [])
-    questions = today_data.get("questions", [])
-    # 构建 questionId -> question 的映射，用于补充 isReview 等字段
+
+    # 构建 questionId -> question 的映射
     qid_to_q = {}
     for q in questions:
         qid = q.get("id", "")
         if qid:
             qid_to_q[qid] = q
 
-    # 补齐 results 缺失的 isReview 字段（从今日题目里取）
+    # 补齐 results 缺失的 isReview 等字段
     for r in results:
         q_id = r.get("questionId", "")
         if q_id in qid_to_q:
             q_detail = qid_to_q[q_id]
             if "isReview" not in r:
                 r["isReview"] = q_detail.get("isReview", False)
-            # 也补齐 kanaHira 如果缺失
             if not r.get("kanaHira"):
                 r["kanaHira"] = q_detail.get("kana", "")
             if not r.get("kanaKata"):
@@ -405,52 +566,36 @@ def main():
         kana = r.get("kana", "?")
         log(f"{q_id}: 用户答={ua} 正确答案={ca} {ic} ({kana})", log_file)
 
-    # 更新目标档案
-    today_data["userReply"] = parsed.get("userReply", "")
-    today_data["questionResults"] = parsed.get("questionResults", [])
-    today_data["correctCount"] = parsed.get("correctCount", 0)
-    today_data["accuracy"] = parsed.get("accuracy", 0)
-    today_data["replied"] = True
-    today_data["repliedAt"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    # 更新对应窗口的数据
+    update_window_data(today_data, matched_window, parsed)
 
     with open(target_file, "w", encoding="utf-8") as f:
         json.dump(today_data, f, ensure_ascii=False, indent=2)
 
-    log(f"目标档案已更新: correctCount={today_data['correctCount']}, accuracy={today_data['accuracy']}%, replied=true, answeredOn={target_date}", log_file)
+    if matched_window:
+        log(f"窗口 [{matched_window}] 已更新: correctCount={parsed.get('correctCount')}, accuracy={parsed.get('accuracy')}%, replied=true", log_file)
+    else:
+        log(f"档案已更新: correctCount={today_data.get('correctCount')}, accuracy={today_data.get('accuracy')}%, replied=true, answeredOn={target_date}", log_file)
 
-    # 更新总体进度（将今日学习的假名加入 mastered 列表）
-    progress_file = os.path.expanduser(config["workspace"]["progress_file"])
-    try:
-        with open(progress_file, "r", encoding="utf-8") as f:
-            progress = json.load(f)
-
-        # 添加今日学习的假名到 mastered
-        for q in today_data.get("questions", []):
-            kana = q.get("kana", "")
-            if kana and kana not in progress.get("mastered", []):
-                if "mastered" not in progress:
-                    progress["mastered"] = []
-                progress["mastered"].append(kana)
-
-        progress["masteredCount"] = len(progress["mastered"])
-        progress["lastUpdateTime"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-        with open(progress_file, "w", encoding="utf-8") as f:
-            json.dump(progress, f, ensure_ascii=False, indent=2)
-
-        log(f"总体进度已更新: masteredCount={progress['masteredCount']}", log_file)
-    except Exception as e:
-        log(f"⚠️ 更新总体进度失败: {e}", log_file)
+    # 更新总体进度
+    update_mastered_progress(today_data, config, log_file)
 
     log("===== 处理完成 =====", log_file)
 
     # 输出结果
-    output = format_output(parsed, today_data)
-    
-    # 如果答题日期不是今天，添加提示
+    output = format_output(parsed, questions)
+
+    # 添加日期/窗口提示
+    prefix_parts = []
     if target_date != today:
-        output = f"📅 回答 {target_date} 的题目\n\n{output}"
-    
+        prefix_parts.append(f"📅 回答 {target_date} 的题目")
+    if matched_window:
+        window_labels = {"morning": "🌅 早间", "afternoon": "☀️ 午间", "evening": "🌙 晚间"}
+        prefix_parts.append(f"{window_labels.get(matched_window, matched_window)}推送")
+
+    if prefix_parts:
+        output = " · ".join(prefix_parts) + "\n\n" + output
+
     print(output)
 
 

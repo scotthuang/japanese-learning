@@ -82,12 +82,19 @@ def analyze_daily_records(daily_dir, all_kana):
         
         date = daily.get("date", "?")
         results = daily.get("questionResults", [])
-        
+
+        # 多窗口新格式：从所有窗口中收集答题结果
+        if "windows" in daily:
+            results = []
+            for w_name in ["morning", "afternoon", "evening"]:
+                w = daily.get("windows", {}).get(w_name, {})
+                results.extend(w.get("questionResults", []))
+
         for q in results:
-            kana = q.get("kana")
+            kana = q.get("kana") or q.get("kanaHira")  # questionResults 可能用 kanaHira
             if not kana or kana not in all_kana:
                 continue
-            
+
             kana_stats[kana]["attempts"] += 1
             if q.get("isCorrect"):
                 kana_stats[kana]["correct"] += 1
@@ -252,9 +259,23 @@ def generate_learning_profile(progress, kana_stats, all_kana, daily_dir):
             date = daily.get("date", "?")
             day_num = daily.get("dayNumber", "?")
             kana_learned = " ".join(daily.get("kanaLearned", []))
-            accuracy = daily.get("accuracy", 0)
-            new_count = len([q for q in daily.get("questionResults", []) if not q.get("isReview")])
-            review_count = len([q for q in daily.get("questionResults", []) if q.get("isReview")])
+
+            # 多窗口新格式：聚合所有窗口的数据
+            if "windows" in daily:
+                total_accuracy = daily.get("totalAccuracy", 0)
+                all_results = []
+                for w_name in ["morning", "afternoon", "evening"]:
+                    w = daily.get("windows", {}).get(w_name, {})
+                    all_results.extend(w.get("questionResults", []))
+                accuracy = total_accuracy
+                new_count = len([q for q in all_results if not q.get("isReview")])
+                review_count = len([q for q in all_results if q.get("isReview")])
+            else:
+                # 旧格式
+                accuracy = daily.get("accuracy", 0)
+                new_count = len([q for q in daily.get("questionResults", []) if not q.get("isReview")])
+                review_count = len([q for q in daily.get("questionResults", []) if q.get("isReview")])
+
             lines.append(f"| {date} | 第{day_num}天 | {kana_learned} | {accuracy}% | {new_count} | {review_count} |")
         except Exception:
             continue

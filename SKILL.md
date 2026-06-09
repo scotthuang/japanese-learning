@@ -352,9 +352,15 @@ A. ナ  B. ニ  C. ヌ
 | `logs.main_log` | 主日志文件路径 | `~/.openclaw/workspace/logs/japanese-learning/main.log` |
 | `api.model` | 使用的混元模型 | `hy3-preview` |
 | `api.api_key` | API key（已配置） | `***` |
-| `push_strategy.interval_seconds` | 推送间隔（秒） | `7200`（2小时） |
-| `push_strategy.random_push_probability` | 随机推送概率（%） | `30` |
-| `push_strategy.questions_per_day` | 每日题目数 | `3` |
+| `push_strategy.interval_seconds` | 心跳间隔（秒） | `1800`（30分钟） |
+| `push_strategy.questions_per_window` | 每窗口题目数 | `3` |
+| `push_strategy.new_per_window` | 每窗口新学数 | `1` |
+| `push_strategy.review_per_window` | 每窗口复习数 | `2` |
+| `push_strategy.windows.morning` | 早间窗口(08-12) | `🌅 早间推送` |
+| `push_strategy.windows.afternoon` | 午间窗口(13-17) | `☀️ 午间推送` |
+| `push_strategy.windows.evening` | 晚间窗口(19-22) | `🌙 晚间推送` |
+| `push_strategy.silent_start` | 静默开始时间 | `22` |
+| `push_strategy.silent_end` | 静默结束时间 | `8` |
 | `wechat.channel` | 微信推送渠道 | `openclaw-weixin` |
 
 **修改配置后，脚本会自动读取新配置，无需重启。**

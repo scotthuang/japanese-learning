@@ -33,3 +33,5 @@ logs/
 !IMPLEMENTATION.md
 !scripts/*.py
 !configs/*.json
+*.bak
+*.backup
