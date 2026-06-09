@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.1.1] — 2026-06-10
+
+### 🐛 修复
+
+- **`push-strategy.py`** — 恢复被重写时遗漏的 `generate_daily_summary()` 函数
+- **cron 导入方式** — `from push-strategy import` 改为 `importlib.util` 动态加载，修复文件名含连字符导致的导入失败
+- **多窗口适配** — `generate_daily_summary()` 支持新老两种数据格式（windows 对象 / 扁平结构）
+
+---
+
 ## [1.1.0] — 2026-06-10
 
 ### ✨ 新增：3 时段随机推送
