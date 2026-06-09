@@ -385,6 +385,88 @@ def build_push_message(selected_new, selected_review, questions, window_name, da
 
     return "\n".join(lines)
 
+def generate_daily_summary(config, log_file):
+    """生成每日学习总结（昨日答题情况）"""
+    daily_dir = os.path.expanduser(config["workspace"]["daily_dir"])
+
+    # 计算昨天的日期
+    today = datetime.now()
+    yesterday = today - timedelta(days=1)
+    yesterday_str = yesterday.strftime("%Y-%m-%d")
+    yesterday_file = os.path.join(daily_dir, f"{yesterday_str}.json")
+
+    if not os.path.isfile(yesterday_file):
+        log(f"昨日 ({yesterday_str}) 无档案，跳过总结", log_file)
+        return None
+
+    try:
+        with open(yesterday_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        log(f"❌ 读取昨日档案失败: {e}", log_file)
+        return None
+
+    # 统计所有窗口的答题情况
+    windows = data.get("windows", {})
+    total_questions = []
+    total_results = []
+    total_correct = 0
+    total_accuracy = 0
+    all_replied = False
+
+    if windows:
+        # 新格式：多窗口
+        for w_name, w_data in windows.items():
+            total_questions.extend(w_data.get("questions", []))
+            total_results.extend(w_data.get("questionResults", []))
+            total_correct += w_data.get("correctCount", 0)
+            if w_data.get("replied"):
+                all_replied = True
+    else:
+        # 旧格式：扁平结构
+        total_questions = data.get("questions", [])
+        total_results = data.get("questionResults", [])
+        total_correct = data.get("correctCount", 0)
+        all_replied = data.get("replied", False)
+
+    kana_learned = data.get("kanaLearned", [])
+    total_q_count = len(total_questions)
+
+    if not all_replied or not total_results:
+        summary = f"""📅 {yesterday_str} 学习总结
+
+⚠️ 昨日未答题
+累计已学：{len(kana_learned)} 个假名"""
+        log(f"昨日未答题", log_file)
+        return summary
+
+    accuracy = (total_correct / len(total_results) * 100) if total_results else 0
+
+    # 构建总结
+    lines = [f"📅 {yesterday_str} 学习总结"]
+    lines.append("")
+    lines.append(f"✅ 正确率: {accuracy:.2f}% ({total_correct}/{len(total_results)})")
+
+    # 显示错题
+    wrong_qs = [r for r in total_results if not r.get("isCorrect")]
+    if wrong_qs:
+        lines.append("")
+        lines.append("❌ 错题回顾:")
+        for r in wrong_qs:
+            kana_hira = r.get("kanaHira", "") or r.get("kana", "")
+            kana_kata = r.get("kanaKata", "")
+            romaji = r.get("romaji", "")
+            user_ans = r.get("userAnswerKana", "") or r.get("userAnswer", "")
+            ca = r.get("correctAnswer", "")
+            lines.append(f"  • {kana_hira} ({romaji}) / {kana_kata} ({romaji})")
+            lines.append(f"    你的答案: {user_ans} ❌  正确答案: {ca} ✅")
+
+    lines.append("")
+    lines.append(f"📚 累计已学: {len(kana_learned)} 个假名")
+
+    return "\n".join(lines)
+
+
 def main():
     # 加载配置
     config = load_config()
