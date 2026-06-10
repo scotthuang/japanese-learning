@@ -49,15 +49,20 @@ description: 日语五十音学习系统。当用户回复五十音练习答案�
 **当触发 Skill 时，LLM 必须：**
 
 1. **不要自己判断对错**，让 Skill 处理
-2. **收集完整消息上下文**：
-   - 用户回复（如 "1A 2B 3C"）
-   - 引用的原始推送消息（含题目ID、题目、正确答案）
-3. **将完整消息拼接成一个字符串**，传给 Skill：
+2. **分离收集两个独立的上下文**：
+   - `--user-reply`：用户回复的答案字符串（如 `"1A 2B 3C"`），**只包含用户的答案，不要掺入正确答案！**
+   - `--full-message`：引用的原始推送消息（含题目ID、题目、选项，用于匹配上下文）
+3. **用双参数方式调用 Skill**（推荐）：
    ```bash
    python3 ~/.openclaw/workspace/skills/japanese-learning/scripts/verify-reply.py \
-     --full-message "完整消息字符串"
+     --user-reply "1A 2B 3C" \
+     --full-message "引用推送消息..."
    ```
+   > ⚠️ **重要**：`--user-reply` 只传用户的实际答案（如 `1C 2B 3B`），
+   > 不要把引用消息中的正确答案误填进去！Skill 脚本自己有题目和正确答案数据，
+   > 会自动判断对错，你只需如实传递用户输入即可。
 4. **等待 Skill 输出结果**，直接返回给用户，不要自己生成回复！
+5. **向后兼容**：如果无法分离，也可以只传 `--full-message`（旧方式仍然可用）。
 
 ## 示例
 
@@ -74,10 +79,21 @@ description: 日语五十音学习系统。当用户回复五十音练习答案�
        ...
 ```
 
-**LLM 执行：**
+**LLM 执行（推荐的双参数方式）：**
 ```bash
 python3 ~/.openclaw/workspace/skills/japanese-learning/scripts/verify-reply.py \
-  --full-message "用户回复：1A 2B 3C\n\n引用消息：\n【提问 1】(ID: q_20260523_001) 平假名「な」的片假名是？\nA. ナ  B. ニ  C. ヌ\n..."
+  --user-reply "1A 2B 3C" \
+  --full-message "【提问 1】(ID: q_20260523_001) 平假名「な」的片假名是？
+A. ナ  B. ニ  C. ヌ
+..."
+```
+> 💡 **关键**：`--user-reply` 只传用户的答案 `1A 2B 3C`，引用消息传 `--full-message`。
+> 脚本内部有正确答案，会自动判断对错，你（LLM）不需要也不应该把正确答案写到 --user-reply 里。
+
+**旧方式（向后兼容，不推荐）：**
+```bash
+python3 ~/.openclaw/workspace/skills/japanese-learning/scripts/verify-reply.py \
+  --full-message "用户回复：1A 2B 3C\n\n引用消息：\n【提问 1】(ID: q_20260523_001) ..."
 ```
 
 **Skill 输出（LLM 直接返回）：**
@@ -204,25 +220,46 @@ A2: ri - りんご（苹果）
 
 ### verify-reply.py（核心！）
 
-**参数：** 只接收 `--full-message "完整消息字符串"`
+**参数：**
+- `--user-reply`（推荐，可选）：用户回复的答案字符串（如 `"1A 2B 3C"`）
+- `--full-message`（可选）：引用推送消息上下文（题目、选项等）
+- 至少需要提供其中一个；推荐两个都传，分离用户答案和引用上下文
+
+**推荐调用方式（双参数）：**
+```bash
+python3 ~/.openclaw/workspace/skills/japanese-learning/scripts/verify-reply.py \
+  --user-reply "1A 2B 3C" \
+  --full-message "【提问 1】(ID: q_20260523_001) ..."
+```
+
+**旧调用方式（向后兼容，单参数）：**
+```bash
+python3 ~/.openclaw/workspace/skills/japanese-learning/scripts/verify-reply.py \
+  --full-message "用户回复：1A 2B 3C\n\n引用消息：\n..."
+```
 
 **内部流程：**
-1. 解析 `--full-message` 参数，获取完整消息
+1. 解析 `--user-reply`（如有）提取用户答案，解析 `--full-message`（如有）获取上下文
 2. 读取配置文件（获取 API key、日志路径）
-3. 调用混元 API（用 LLM 推理）解析完整消息
+3. 调用混元 API（用 LLM 推理）匹配答案和判断对错
+   - 如果提供了 `--user-reply`，用户答案已明确，LLM 只需匹配和判断
+   - 如果只有 `--full-message`，LLM 自行从完整消息中提取答案（向后兼容）
    - Prompt 要求返回结构化 JSON（含 questionResults）
-4. 读取今日档案 `daily/YYYY-MM-DD.json`
-5. 更新今日档案：
+4. 读取目标档案 `daily/YYYY-MM-DD.json`
+5. 更新档案中对应窗口的数据：
    - `userReply`: 用户回复
    - `questionResults`: 每道题的详细结果（题目、五十音、对错）
    - `correctCount`, `accuracy`, `replied=true`
 6. 输出结果给 LLM（Q1 ✅ Q2 ❌... 格式）
 
-**完整消息字符串格式：**
+**`--user-reply` 字符串格式：**
 ```
-用户回复：1A 2B 3C
+1A 2B 3C
+```
+支持空格分隔或连写（如 `1A2B3C`），答案字母支持 A/B/C（大小写均可）。
 
-引用消息：
+**`--full-message` 字符串格式（作为引用上下文）：**
+```
 【提问 1】(ID: q_20260523_001) 平假名「な」的片假名是？
 A. ナ  B. ニ  C. ヌ
 

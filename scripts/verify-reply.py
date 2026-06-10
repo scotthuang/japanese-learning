@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
 验证用户回复，更新今日档案（多窗口适配版）
-用法：verify-reply.py --full-message "完整消息字符串"
-- 只接收 --full-message 参数
+用法：
+  # 推荐方式：分离用户回复和引用上下文
+  verify-reply.py --user-reply "1C 2B 3B" --full-message "引用上下文..."
+  # 旧方式（向后兼容）：只传完整消息
+  verify-reply.py --full-message "用户回复: 1C 2B 3B\n\n引用: ..."
+- --user-reply 接收用户回复字符串（如 "1C 2B 3B"），可选
+- --full-message 接收引用消息上下文，可选（如果传了作为引用上下文）
+- 至少需要提供 --user-reply 或 --full-message 之一
 - 用 LLM 推理解析完整消息（不用正则）
 - 匹配回复到正确的窗口（morning/afternoon/evening）
 - 更新 daily/*.json 中对应窗口的 questionResults 等字段
@@ -36,6 +42,24 @@ def log(msg, log_file):
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
     with open(log_file, "a", encoding="utf-8") as f:
         f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [VERIFY] {msg}\n")
+
+
+def parse_user_reply(user_reply):
+    """
+    解析用户回复字符串（如 "1C 2B 3B"）
+    返回 dict: {1: "C", 2: "B", 3: "B"}
+    如果解析失败返回空 dict
+    """
+    result = {}
+    if not user_reply or not user_reply.strip():
+        return result
+
+    # 匹配 "1A" "2B" "3C" 等格式（支持空格分隔或连写如 "1A2B3C"）
+    pattern = re.findall(r'(\d+)\s*([A-Ca-c])', user_reply)
+    for num, letter in pattern:
+        result[int(num)] = letter.upper()
+
+    return result
 
 
 def is_new_format(data):
@@ -166,8 +190,10 @@ def call_hunyuan_api(api_key, base_url, model, messages):
         raise RuntimeError(f"API 调用失败: {e}")
 
 
-def llm_parse_full_message(full_message, config, questions, log_file):
-    """用 LLM 推理解析完整消息"""
+def llm_parse_full_message(full_message, config, questions, log_file, user_reply=""):
+    """用 LLM 推理解析完整消息。
+    如果提供了 user_reply，则从中提取用户答案；否则从 full_message 中解析（向后兼容）。
+    """
 
     # 构造题目信息供 LLM 参考
     questions_info = ""
@@ -186,7 +212,64 @@ def llm_parse_full_message(full_message, config, questions, log_file):
             f"  五十音: {kana} (平假名) / {kanaKata} (片假名)\n\n"
         )
 
-    prompt = f"""你是一个日语学习系统的答案解析器。
+    if user_reply:
+        # 新方式：用户答案已从 --user-reply 明确提供，LLM 只需要匹配和判断对错
+        parsed_answers = parse_user_reply(user_reply)
+        answers_str = "\n".join([f"  第{q_num}题: {ans}" for q_num, ans in sorted(parsed_answers.items())])
+        log(f"从 --user-reply 解析到 {len(parsed_answers)} 个答案: {parsed_answers}", log_file)
+
+        prompt = f"""你是一个日语学习系统的答案解析器。
+
+用户的答案已经明确提供如下（来自 --user-reply 参数，格式为"题号 答案字母"）：
+
+{answers_str}
+
+以下是引用推送消息的上下文（包含题目顺序和内容，用于确认匹配关系）：
+
+```
+{full_message}
+```
+
+以下是本次推送的题目信息（含正确答案，供你判断对错）：
+
+{questions_info}
+
+请将用户的每个答案按顺序匹配到对应的题目（第1题对应questions的第1个，以此类推），判断对错，然后输出严格的 JSON（不要输出 ```json ``` 标记，不要输出任何其他解释文字）：
+
+```json
+{{
+  "userReply": "用户原始回复内容（如 1A 2B 3C）",
+  "questionResults": [
+    {{
+      "questionId": "题目ID（如 q_20260523_001）",
+      "question": "题目文本",
+      "kanaHira": "对应的五十音平假名",
+      "kanaKata": "对应的五十音片假名",
+      "romaji": "对应的罗马音",
+      "userAnswer": "用户选择的答案字母（A/B/C）",
+      "userAnswerKana": "用户选择的假名（从选项中提取，如 ア）",
+      "userAnswerRomaji": "用户选择假名的罗马音",
+      "correctAnswer": "正确答案字母（A/B/C）",
+      "isCorrect": true
+    }}
+  ],
+  "correctCount": 正确的题目数量（整数）,
+  "accuracy": 正确率（浮点数，如66.67）
+}}
+```
+
+重要要求：
+1. 用户的答案已经明确给出（见上方），请按顺序将第1题答案匹配到第1个题目，第2题到第2个，以此类推
+2. 根据引用的原始推送消息或题目ID确认匹配关系
+3. questionResults 数组长度必须等于题目数量
+4. accuracy 是百分比（如 66.67 表示 66.67%），不是小数
+5. 只输出 JSON，不要任何多余文字
+6. userAnswerKana 和 userAnswerRomaji 必须从用户选择的选项中提取假名和罗马音
+7. 如果选项是假名（如 ア (a)），提取假名部分（如 ア）并查找对应的罗马音
+"""
+    else:
+        # 旧方式：从 full_message 中解析（向后兼容）
+        prompt = f"""你是一个日语学习系统的答案解析器。
 
 以下是用户回复和原始推送消息的完整内容：
 
@@ -431,11 +514,20 @@ def update_mastered_progress(today_data, config, log_file):
 
 def main():
     parser = argparse.ArgumentParser(description="日语学习答案验证（多窗口LLM推理版）")
-    parser.add_argument("--full-message", required=True,
-                        help="完整消息字符串（用户回复 + 引用的原始推送消息）")
+    parser.add_argument("--full-message", default="",
+                        help="完整消息字符串（引用推送消息上下文，可选；如果只传 --user-reply 则作为上下文）")
+    parser.add_argument("--user-reply", default="",
+                        help="用户回复字符串（如 1C 2B 3B），可选；提供后优先从该参数提取用户答案")
     args = parser.parse_args()
 
     full_message = args.full_message
+    user_reply = args.user_reply
+
+    # 至少需要提供 --user-reply 或 --full-message 之一
+    if not full_message and not user_reply:
+        print("❌ 至少需要提供 --user-reply 或 --full-message 参数", file=sys.stderr)
+        print("   用法: verify-reply.py --user-reply \"1C 2B 3B\" [--full-message \"引用上下文...\"]", file=sys.stderr)
+        sys.exit(1)
 
     # 加载配置
     config = load_config()
@@ -448,7 +540,7 @@ def main():
 
     log("=" * 60, log_file)
     log("===== 开始处理用户回复 =====", log_file)
-    log(f"收到完整消息（长度: {len(full_message)} 字符）", log_file)
+    log(f"收到用户回复: '{user_reply}' (长度: {len(user_reply)} 字符), 完整消息长度: {len(full_message)} 字符", log_file)
 
     # 智能查找目标档案和窗口
     target_file, target_date, window_name = find_target_file_and_window(config, full_message)
@@ -512,7 +604,7 @@ def main():
 
     # 用 LLM 推理解析完整消息
     try:
-        parsed = llm_parse_full_message(full_message, config, questions, log_file)
+        parsed = llm_parse_full_message(full_message, config, questions, log_file, user_reply)
     except Exception as e:
         log(f"❌ LLM 推理失败: {e}", log_file)
         print(f"❌ 答案解析失败，请稍后重试或联系管理员")

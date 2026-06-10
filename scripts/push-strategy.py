@@ -14,6 +14,7 @@ import random
 import re
 import glob
 import subprocess
+import fcntl
 from datetime import datetime, timedelta
 from collections import defaultdict
 
@@ -30,6 +31,9 @@ WINDOW_EMOJI = {
     "afternoon": "☀️",
     "evening": "🌙",
 }
+
+# 文件锁路径（防止并发执行）
+LOCK_FILE = "/tmp/japanese-push.lock"
 
 def load_config():
     """加载配置文件"""
@@ -467,6 +471,18 @@ def generate_daily_summary(config, log_file):
     return "\n".join(lines)
 
 
+def acquire_lock():
+    """获取文件锁，防止并发执行。成功返回 fd，失败返回 None。"""
+    try:
+        lock_fd = open(LOCK_FILE, 'w')
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_fd.write(f"pid={os.getpid()}\nstarted={datetime.now():%Y-%m-%d %H:%M:%S}\n")
+        lock_fd.flush()
+        return lock_fd
+    except (IOError, OSError):
+        return None
+
+
 def main():
     # 加载配置
     config = load_config()
@@ -497,183 +513,195 @@ def main():
     # 从配置读取路径
     openclaw_bin = config["paths"]["openclaw_bin"]
 
-    log("=" * 60, log_file)
-    log("心跳触发推送检查（3时段推送模式）", log_file)
-
-    # 1. 确保 daily 目录存在
-    os.makedirs(daily_dir, exist_ok=True)
-
-    now = datetime.now()
-    today = now.strftime("%Y-%m-%d")
-    today_file = os.path.join(daily_dir, f"{today}.json")
-
-    # 2. 判断当前时间窗口
-    current_window = get_current_window(config)
-
-    if current_window is None:
-        hour = now.hour
-        silent_start = push_config.get("silent_start", 22)
-        silent_end = push_config.get("silent_end", 8)
-        if hour >= silent_start or hour < silent_end:
-            log(f"当前时间 {now:%H:%M} 在静默时段（{silent_start}:00-{silent_end}:00），不推送", log_file)
-        else:
-            log(f"当前时间 {now:%H:%M} 不在任何推送窗口内（窗口间隙），不推送", log_file)
+    # 获取文件锁，防止并发执行
+    lock_fd = acquire_lock()
+    if lock_fd is None:
+        log("⚠️ 发现已有实例在运行（文件锁），跳过本次推送", log_file)
         sys.exit(0)
-
-    log(f"当前窗口: {current_window} ({get_window_label(current_window)})", log_file)
-
-    # 3. 读取今日档案
-    today_data = None
-    if os.path.isfile(today_file):
-        today_data = load_json(today_file)
-        if today_data is None:
-            log(f"❌ 读取今日档案失败: {today_file}", log_file)
-            sys.exit(1)
-
-        # 检测并迁移旧格式
-        if "windows" not in today_data:
-            log("检测到旧格式档案，正在迁移到新格式...", log_file)
-            # 获取 day number
-            progress = load_json(progress_file)
-            day_number = progress.get("masteredCount", 0) + 1 if progress else 1
-            today_data = migrate_old_format(today_data, today, day_number)
-            save_json(today_file, today_data)
-            log("旧格式迁移完成", log_file)
-
-    # 4. 读取进度文件
-    progress = load_json(progress_file)
-    if not progress:
-        log("❌ 无法读取进度文件", log_file)
-        sys.exit(1)
-
-    day_number = progress.get("masteredCount", 0) + 1
-
-    # 5. 如果今日档案不存在，初始化
-    if today_data is None:
-        today_data = init_today_file(today, day_number)
-        log(f"初始化今日档案: {today_file}", log_file)
-
-    # 6. 检查当前窗口是否已推送
-    windows = today_data.get("windows", {})
-    current_win_data = windows.get(current_window, {})
-
-    if current_win_data.get("pushed", False):
-        log(f"窗口 [{current_window}] 已推送（{current_win_data.get('pushedAt')}），跳过", log_file)
-        sys.exit(0)
-
-    # 7. 检查所有窗口是否都已推送
-    if all_windows_pushed(today_data):
-        log("所有3个窗口已推送完毕，今日不再推送", log_file)
-        sys.exit(0)
-
-    # 8. 选择假名
-    with open(kana_data_file, "r", encoding="utf-8") as f:
-        kana_data = json.load(f)
-
-    # 构建假名列表
-    all_kana = []
-    for row in kana_data["rows"]:
-        for k in row["kana"]:
-            all_kana.append(k)
-
-    mastered = set(progress.get("mastered", []))
-
-    # 收集当天已用假名
-    used_new, used_review = get_used_kana_in_today(today_data)
-
-    # 从方案读取推荐
-    next_day_plan = progress.get("nextDayPlan", {})
-    quiz_plan = next_day_plan.get("quizPlan", {})
-    suggested_new_hira = quiz_plan.get("newKanaForQuiz", [])
-    suggested_review_hira = quiz_plan.get("reviewKanaForQuiz", [])
-
-    log(f"当天已用新学假名: {used_new}", log_file)
-    log(f"当天已用复习假名: {used_review}", log_file)
-    log(f"方案推荐新学: {suggested_new_hira}", log_file)
-    log(f"方案推荐复习: {suggested_review_hira}", log_file)
-
-    # 选择新学假名
-    selected_new = select_new_kana(all_kana, mastered, used_new, suggested_new_hira, new_per_window)
-
-    # 选择复习假名
-    selected_review = select_review_kana(all_kana, mastered, used_review, suggested_review_hira, review_per_window)
-
-    # 边界处理：如果没有新学假名了，全部用复习
-    if not selected_new:
-        log("⚠️ 没有新的假名可学，本次全部使用复习题", log_file)
-        # 多选一些复习假名来填充
-        extra_review = select_review_kana(all_kana, mastered, used_review.union(
-            set(k["hiragana"] for k in selected_review)
-        ), suggested_review_hira, new_per_window)
-        selected_new = extra_review  # 放新学位置（但 isReview=True 的题目）
-        # 如果连复习也没有
-        if not selected_new and not selected_review:
-            log("所有假名已学完且无可复习内容！", log_file)
-            sys.exit(0)
-
-    # 边界处理：如果没有复习假名
-    if not selected_review:
-        log("⚠️ 没有可复习的假名，全部使用新学题", log_file)
-        extra_new = select_new_kana(all_kana, mastered, used_new.union(
-            set(k["hiragana"] for k in selected_new)
-        ), suggested_new_hira, review_per_window)
-        # 如果要复习的也没有，至少保证有新学的
-        if extra_new:
-            selected_review = extra_new
-            # 这些实际是"新学"假名，但标记为复习（用户已掌握）
-            # 保持逻辑一致：标记为复习题
-
-    log(f"选中新学: {[k['hiragana'] for k in selected_new]}", log_file)
-    log(f"选中复习: {[k['hiragana'] for k in selected_review]}", log_file)
-
-    # 9. 生成题目
-    questions = generate_questions_for_window(selected_new, selected_review, all_kana, current_window)
-
-    # 10. 构建推送消息
-    msg = build_push_message(selected_new, selected_review, questions, current_window, day_number)
-    log(f"推送消息：\n{msg}", log_file)
-
-    # 11. 调用 openclaw message send 推送
-    cmd = [
-        openclaw_bin, "message", "send",
-        "--channel", channel,
-        "--target", target,
-        "--message", msg,
-    ]
+    log("🔒 已获取推送锁", log_file)
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode == 0:
-            log("✅ 推送成功", log_file)
+        log("=" * 60, log_file)
+        log("心跳触发推送检查（3时段推送模式）", log_file)
 
-            # 更新当前窗口为已推送
-            current_win_data["pushed"] = True
-            current_win_data["pushedAt"] = now.strftime("%Y-%m-%d %H:%M")
-            current_win_data["questions"] = questions
+        # 1. 确保 daily 目录存在
+        os.makedirs(daily_dir, exist_ok=True)
 
-            # 更新当天已学假名列表（去重）
-            existing_learned = set(today_data.get("kanaLearned", []))
-            for k in selected_new:
-                existing_learned.add(k["hiragana"])
-            today_data["kanaLearned"] = list(existing_learned)
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        today_file = os.path.join(daily_dir, f"{today}.json")
 
-            # 检查所有窗口是否都已推送
-            if all_windows_pushed(today_data):
-                today_data["allWindowsPushed"] = True
-                log("🎉 所有3个窗口已推送完毕！", log_file)
+        # 2. 判断当前时间窗口
+        current_window = get_current_window(config)
 
-            save_json(today_file, today_data)
+        if current_window is None:
+            hour = now.hour
+            silent_start = push_config.get("silent_start", 22)
+            silent_end = push_config.get("silent_end", 8)
+            if hour >= silent_start or hour < silent_end:
+                log(f"当前时间 {now:%H:%M} 在静默时段（{silent_start}:00-{silent_end}:00），不推送", log_file)
+            else:
+                log(f"当前时间 {now:%H:%M} 不在任何推送窗口内（窗口间隙），不推送", log_file)
+            sys.exit(0)
 
-            # 更新进度文件的最后推送时间
-            progress["lastPushTime"] = now.strftime("%Y-%m-%d %H:%M")
-            save_json(progress_file, progress)
+        log(f"当前窗口: {current_window} ({get_window_label(current_window)})", log_file)
 
-        else:
-            log(f"❌ 推送失败: {result.stderr}", log_file)
-    except Exception as e:
-        log(f"❌ 推送异常: {e}", log_file)
+        # 3. 读取今日档案
+        today_data = None
+        if os.path.isfile(today_file):
+            today_data = load_json(today_file)
+            if today_data is None:
+                log(f"❌ 读取今日档案失败: {today_file}", log_file)
+                sys.exit(1)
 
-    log("推送流程完成", log_file)
+            # 检测并迁移旧格式
+            if "windows" not in today_data:
+                log("检测到旧格式档案，正在迁移到新格式...", log_file)
+                # 获取 day number
+                progress = load_json(progress_file)
+                day_number = progress.get("masteredCount", 0) + 1 if progress else 1
+                today_data = migrate_old_format(today_data, today, day_number)
+                save_json(today_file, today_data)
+                log("旧格式迁移完成", log_file)
+
+        # 4. 读取进度文件
+        progress = load_json(progress_file)
+        if not progress:
+            log("❌ 无法读取进度文件", log_file)
+            sys.exit(1)
+
+        day_number = progress.get("masteredCount", 0) + 1
+
+        # 5. 如果今日档案不存在，初始化
+        if today_data is None:
+            today_data = init_today_file(today, day_number)
+            log(f"初始化今日档案: {today_file}", log_file)
+
+        # 6. 检查当前窗口是否已推送
+        windows = today_data.get("windows", {})
+        current_win_data = windows.get(current_window, {})
+
+        if current_win_data.get("pushed", False):
+            log(f"窗口 [{current_window}] 已推送（{current_win_data.get('pushedAt')}），跳过", log_file)
+            sys.exit(0)
+
+        # 7. 检查所有窗口是否都已推送
+        if all_windows_pushed(today_data):
+            log("所有3个窗口已推送完毕，今日不再推送", log_file)
+            sys.exit(0)
+
+        # 8. 选择假名
+        with open(kana_data_file, "r", encoding="utf-8") as f:
+            kana_data = json.load(f)
+
+        # 构建假名列表
+        all_kana = []
+        for row in kana_data["rows"]:
+            for k in row["kana"]:
+                all_kana.append(k)
+
+        mastered = set(progress.get("mastered", []))
+
+        # 收集当天已用假名
+        used_new, used_review = get_used_kana_in_today(today_data)
+
+        # 从方案读取推荐
+        next_day_plan = progress.get("nextDayPlan", {})
+        quiz_plan = next_day_plan.get("quizPlan", {})
+        suggested_new_hira = quiz_plan.get("newKanaForQuiz", [])
+        suggested_review_hira = quiz_plan.get("reviewKanaForQuiz", [])
+
+        log(f"当天已用新学假名: {used_new}", log_file)
+        log(f"当天已用复习假名: {used_review}", log_file)
+        log(f"方案推荐新学: {suggested_new_hira}", log_file)
+        log(f"方案推荐复习: {suggested_review_hira}", log_file)
+
+        # 选择新学假名
+        selected_new = select_new_kana(all_kana, mastered, used_new, suggested_new_hira, new_per_window)
+
+        # 选择复习假名
+        selected_review = select_review_kana(all_kana, mastered, used_review, suggested_review_hira, review_per_window)
+
+        # 边界处理：如果没有新学假名了，全部用复习
+        if not selected_new:
+            log("⚠️ 没有新的假名可学，本次全部使用复习题", log_file)
+            # 多选一些复习假名来填充
+            extra_review = select_review_kana(all_kana, mastered, used_review.union(
+                set(k["hiragana"] for k in selected_review)
+            ), suggested_review_hira, new_per_window)
+            selected_new = extra_review  # 放新学位置（但 isReview=True 的题目）
+            # 如果连复习也没有
+            if not selected_new and not selected_review:
+                log("所有假名已学完且无可复习内容！", log_file)
+                sys.exit(0)
+
+        # 边界处理：如果没有复习假名
+        if not selected_review:
+            log("⚠️ 没有可复习的假名，全部使用新学题", log_file)
+            extra_new = select_new_kana(all_kana, mastered, used_new.union(
+                set(k["hiragana"] for k in selected_new)
+            ), suggested_new_hira, review_per_window)
+            # 如果要复习的也没有，至少保证有新学的
+            if extra_new:
+                selected_review = extra_new
+                # 这些实际是"新学"假名，但标记为复习（用户已掌握）
+                # 保持逻辑一致：标记为复习题
+
+        log(f"选中新学: {[k['hiragana'] for k in selected_new]}", log_file)
+        log(f"选中复习: {[k['hiragana'] for k in selected_review]}", log_file)
+
+        # 9. 生成题目
+        questions = generate_questions_for_window(selected_new, selected_review, all_kana, current_window)
+
+        # 10. 构建推送消息
+        msg = build_push_message(selected_new, selected_review, questions, current_window, day_number)
+        log(f"推送消息：\n{msg}", log_file)
+
+        # 11. 调用 openclaw message send 推送
+        cmd = [
+            openclaw_bin, "message", "send",
+            "--channel", channel,
+            "--target", target,
+            "--message", msg,
+        ]
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                log("✅ 推送成功", log_file)
+
+                # 更新当前窗口为已推送
+                current_win_data["pushed"] = True
+                current_win_data["pushedAt"] = now.strftime("%Y-%m-%d %H:%M")
+                current_win_data["questions"] = questions
+
+                # 更新当天已学假名列表（去重）
+                existing_learned = set(today_data.get("kanaLearned", []))
+                for k in selected_new:
+                    existing_learned.add(k["hiragana"])
+                today_data["kanaLearned"] = list(existing_learned)
+
+                # 检查所有窗口是否都已推送
+                if all_windows_pushed(today_data):
+                    today_data["allWindowsPushed"] = True
+                    log("🎉 所有3个窗口已推送完毕！", log_file)
+
+                save_json(today_file, today_data)
+
+                # 更新进度文件的最后推送时间
+                progress["lastPushTime"] = now.strftime("%Y-%m-%d %H:%M")
+                save_json(progress_file, progress)
+
+            else:
+                log(f"❌ 推送失败: {result.stderr}", log_file)
+        except Exception as e:
+            log(f"❌ 推送异常: {e}", log_file)
+
+        log("推送流程完成", log_file)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+        log("🔓 已释放推送锁", log_file)
 
 if __name__ == "__main__":
     main()
