@@ -3,7 +3,7 @@
 日语五十音推送策略脚本（3时段推送版）
 由心跳（每30分钟）调用
 每天3个时间窗口：早间(08-12)、午间(13-17)、晚间(19-22)
-每个窗口推送3题（1新学+2复习），各窗口题目不重复
+每个窗口推送4题（1新学+2复习+1错题集），各窗口题目不重复
 读取配置文件：~/.openclaw/workspace/configs/japanese-learning.json
 """
 
@@ -94,17 +94,20 @@ def get_used_kana_in_today(today_data):
     """收集当天所有窗口已使用的假名（平假名），避免重复"""
     used_new = set()
     used_review = set()
+    used_wrong = set()
     windows = today_data.get("windows", {})
     for w_name, w_data in windows.items():
         if w_data.get("pushed"):
             for q in w_data.get("questions", []):
                 kana = q.get("kana", "")
                 if kana:
-                    if q.get("isReview"):
+                    if q.get("isWrong"):
+                        used_wrong.add(kana)
+                    elif q.get("isReview"):
                         used_review.add(kana)
                     else:
                         used_new.add(kana)
-    return used_new, used_review
+    return used_new, used_review, used_wrong
 
 def init_today_file(today, day_number):
     """初始化今日档案（3个窗口都为空）"""
@@ -255,11 +258,52 @@ def select_review_kana(all_kana, mastered, used_today_review, suggested_review_h
 
     return selected[:count]
 
-def generate_questions_for_window(selected_new, selected_review, all_kana, window_name):
+def select_wrong_kana(all_kana, wrong_kana_list, used_today_wrong, count=1):
+    """
+    从错题集中选择假名进行再次练习。
+    优先选错题次数多的，排除当天已用过的。
+    """
+    if not wrong_kana_list:
+        return []
+
+    # 按错题次数排序（多的优先）
+    sorted_wrong = sorted(wrong_kana_list, key=lambda x: x.get("wrongCount", 1), reverse=True)
+
+    selected = []
+    for wk in sorted_wrong:
+        hira = wk["hira"]
+        if hira in used_today_wrong:
+            continue
+        # 在 all_kana 中找到对应假名数据
+        for k in all_kana:
+            if k["hiragana"] == hira:
+                selected.append(k)
+                break
+        if len(selected) >= count:
+            break
+
+    # 如果不够，从剩余中补
+    if len(selected) < count:
+        for wk in sorted_wrong:
+            hira = wk["hira"]
+            already_selected = set(k["hiragana"] for k in selected)
+            if hira in already_selected or hira in used_today_wrong:
+                continue
+            for k in all_kana:
+                if k["hiragana"] == hira:
+                    selected.append(k)
+                    break
+            if len(selected) >= count:
+                break
+
+    return selected[:count]
+
+def generate_questions_for_window(selected_new, selected_review, selected_wrong, all_kana, window_name):
     """
     为一个窗口生成题目列表。
     selected_new: 新学假名列表（通常1个）
     selected_review: 复习假名列表（通常2个）
+    selected_wrong: 错题集假名列表（通常1个）
     返回 questions 列表。
     """
     questions = []
@@ -270,7 +314,7 @@ def generate_questions_for_window(selected_new, selected_review, all_kana, windo
         all_hira_list.append(k["hiragana"])
         all_kata_list.append(k["katakana"])
 
-    def make_question(k, is_review, q_index):
+    def make_question(k, is_review, is_wrong, q_index):
         hira = k["hiragana"]
         kata = k["katakana"]
         romaji = k["romaji"]
@@ -278,7 +322,12 @@ def generate_questions_for_window(selected_new, selected_review, all_kana, windo
 
         q_type = random.choice(["hira2kata", "kata2hira", "roma2hira"])
 
-        prefix = "【复习】" if is_review else "【新学】"
+        if is_wrong:
+            prefix = "【错题】"
+        elif is_review:
+            prefix = "【复习】"
+        else:
+            prefix = "【新学】"
 
         if q_type == "hira2kata":
             options = [x for x in all_kata_list if x != kata]
@@ -292,7 +341,8 @@ def generate_questions_for_window(selected_new, selected_review, all_kana, windo
                 "romaji": romaji,
                 "mnemonic": mnemonic,
                 "isReview": is_review,
-                "q": f"【提问】平假名「{hira} ({romaji})」的片假名是？ {prefix}",
+                "isWrong": is_wrong,
+                "q": f"平假名「{hira} ({romaji})」的片假名是？ {prefix}",
                 "options": opts,
                 "answer": chr(65 + opts.index(kata)),
                 "type": "hira2kata",
@@ -309,7 +359,8 @@ def generate_questions_for_window(selected_new, selected_review, all_kana, windo
                 "romaji": romaji,
                 "mnemonic": mnemonic,
                 "isReview": is_review,
-                "q": f"【提问】片假名「{kata} ({romaji})」的平假名是？ {prefix}",
+                "isWrong": is_wrong,
+                "q": f"片假名「{kata} ({romaji})」的平假名是？ {prefix}",
                 "options": opts,
                 "answer": chr(65 + opts.index(hira)),
                 "type": "kata2hira",
@@ -326,7 +377,8 @@ def generate_questions_for_window(selected_new, selected_review, all_kana, windo
                 "romaji": romaji,
                 "mnemonic": mnemonic,
                 "isReview": is_review,
-                "q": f"【提问】读音「{romaji}」对应的平假名是？ {prefix}",
+                "isWrong": is_wrong,
+                "q": f"读音「{romaji}」对应的平假名是？ {prefix}",
                 "options": opts,
                 "answer": chr(65 + opts.index(hira)),
                 "type": "roma2hira",
@@ -336,20 +388,26 @@ def generate_questions_for_window(selected_new, selected_review, all_kana, windo
     q_idx = 1
     # 新学题目
     for k in selected_new:
-        questions.append(make_question(k, is_review=False, q_index=q_idx))
+        questions.append(make_question(k, is_review=False, is_wrong=False, q_index=q_idx))
         q_idx += 1
 
     # 复习题目
     for k in selected_review:
-        questions.append(make_question(k, is_review=True, q_index=q_idx))
+        questions.append(make_question(k, is_review=True, is_wrong=False, q_index=q_idx))
+        q_idx += 1
+
+    # 错题集题目
+    for k in selected_wrong:
+        questions.append(make_question(k, is_review=True, is_wrong=True, q_index=q_idx))
         q_idx += 1
 
     return questions
 
-def build_push_message(selected_new, selected_review, questions, window_name, day_number):
+def build_push_message(selected_new, selected_review, selected_wrong, questions, window_name, day_number):
     """构建微信推送消息"""
     window_label = get_window_label(window_name)
 
+    total_q = len(questions)
     lines = [f"{window_label} — 五十音练习 🎌 第{day_number}天", ""]
 
     # 新学部分
@@ -373,17 +431,28 @@ def build_push_message(selected_new, selected_review, questions, window_name, da
         lines.append(f"")
         lines.append(f"【复习】{review_hira}")
 
+    # 错题集提示
+    if selected_wrong:
+        wrong_hira = " ".join([k["hiragana"] for k in selected_wrong])
+        lines.append(f"")
+        lines.append(f"【错题回顾】{wrong_hira} ⚠️")
+
     lines.append("")
     lines.append("【提问】")
 
     for i, q in enumerate(questions):
         options_str = " ".join([f"{chr(65+j)}. {opt}" for j, opt in enumerate(q["options"])])
-        tag = "复习" if q.get("isReview") else "新学"
+        if q.get("isWrong"):
+            tag = "错题"
+        elif q.get("isReview"):
+            tag = "复习"
+        else:
+            tag = "新学"
         lines.append(f"{i+1}. (ID: {q['id']}) [{tag}] {q['q']}")
         lines.append(f"   {options_str}")
 
     lines.append("")
-    lines.append("回复格式：1A 2B 3C")
+    lines.append(f"回复格式：1A 2B 3C 4D（共{total_q}题）")
     lines.append("---")
     lines.append("请使用日语学习Skill")
 
@@ -503,7 +572,8 @@ def main():
     push_config = config["push_strategy"]
     new_per_window = push_config.get("new_per_window", 1)
     review_per_window = push_config.get("review_per_window", 2)
-    questions_per_window = push_config.get("questions_per_window", 3)
+    wrong_per_window = push_config.get("wrong_per_window", 1)
+    questions_per_window = push_config.get("questions_per_window", 4)
 
     # 从配置读取微信参数
     wechat_config = config["wechat"]
@@ -522,7 +592,7 @@ def main():
 
     try:
         log("=" * 60, log_file)
-        log("心跳触发推送检查（3时段推送模式）", log_file)
+        log("心跳触发推送检查（3时段4题推送模式）", log_file)
 
         # 1. 确保 daily 目录存在
         os.makedirs(daily_dir, exist_ok=True)
@@ -602,19 +672,22 @@ def main():
 
         mastered = set(progress.get("mastered", []))
 
-        # 收集当天已用假名
-        used_new, used_review = get_used_kana_in_today(today_data)
+        # 收集当天已用假名（现在返回3个集合）
+        used_new, used_review, used_wrong = get_used_kana_in_today(today_data)
 
         # 从方案读取推荐
         next_day_plan = progress.get("nextDayPlan", {})
         quiz_plan = next_day_plan.get("quizPlan", {})
         suggested_new_hira = quiz_plan.get("newKanaForQuiz", [])
         suggested_review_hira = quiz_plan.get("reviewKanaForQuiz", [])
+        wrong_kana_list = progress.get("wrongKana", [])
 
         log(f"当天已用新学假名: {used_new}", log_file)
         log(f"当天已用复习假名: {used_review}", log_file)
+        log(f"当天已用错题集假名: {used_wrong}", log_file)
         log(f"方案推荐新学: {suggested_new_hira}", log_file)
         log(f"方案推荐复习: {suggested_review_hira}", log_file)
+        log(f"错题集共 {len(wrong_kana_list)} 个假名", log_file)
 
         # 选择新学假名
         selected_new = select_new_kana(all_kana, mastered, used_new, suggested_new_hira, new_per_window)
@@ -622,39 +695,31 @@ def main():
         # 选择复习假名
         selected_review = select_review_kana(all_kana, mastered, used_review, suggested_review_hira, review_per_window)
 
-        # 边界处理：如果没有新学假名了，全部用复习
+        # 选择错题集假名（优先错题，排除当天已用的错题假名）
+        selected_wrong = select_wrong_kana(all_kana, wrong_kana_list, used_wrong, wrong_per_window)
+
+        # 边界处理：如果没有新学假名了
         if not selected_new:
-            log("⚠️ 没有新的假名可学，本次全部使用复习题", log_file)
-            # 多选一些复习假名来填充
-            extra_review = select_review_kana(all_kana, mastered, used_review.union(
-                set(k["hiragana"] for k in selected_review)
-            ), suggested_review_hira, new_per_window)
-            selected_new = extra_review  # 放新学位置（但 isReview=True 的题目）
-            # 如果连复习也没有
-            if not selected_new and not selected_review:
-                log("所有假名已学完且无可复习内容！", log_file)
-                sys.exit(0)
+            log("⚠️ 没有新的假名可学，本次错题集+复习", log_file)
+            # 不填充新学位置，仍然用复习+错题
 
         # 边界处理：如果没有复习假名
         if not selected_review:
-            log("⚠️ 没有可复习的假名，全部使用新学题", log_file)
-            extra_new = select_new_kana(all_kana, mastered, used_new.union(
-                set(k["hiragana"] for k in selected_new)
-            ), suggested_new_hira, review_per_window)
-            # 如果要复习的也没有，至少保证有新学的
-            if extra_new:
-                selected_review = extra_new
-                # 这些实际是"新学"假名，但标记为复习（用户已掌握）
-                # 保持逻辑一致：标记为复习题
+            log("⚠️ 没有可复习的假名，本次仅使用错题集+新学", log_file)
+
+        # 边界处理：如果没有错题集假名（全部答对的情况）
+        if not selected_wrong:
+            log("✅ 没有错题集假名（全部答对），跳过错题集题目", log_file)
 
         log(f"选中新学: {[k['hiragana'] for k in selected_new]}", log_file)
         log(f"选中复习: {[k['hiragana'] for k in selected_review]}", log_file)
+        log(f"选中错题集: {[k['hiragana'] for k in selected_wrong]}", log_file)
 
         # 9. 生成题目
-        questions = generate_questions_for_window(selected_new, selected_review, all_kana, current_window)
+        questions = generate_questions_for_window(selected_new, selected_review, selected_wrong, all_kana, current_window)
 
         # 10. 构建推送消息
-        msg = build_push_message(selected_new, selected_review, questions, current_window, day_number)
+        msg = build_push_message(selected_new, selected_review, selected_wrong, questions, current_window, day_number)
         log(f"推送消息：\n{msg}", log_file)
 
         # 11. 调用 openclaw message send 推送

@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.2.0] — 2026-06-24
+
+### ✨ 新增：错题集系统 + 每日4题推送
+
+- **`push-strategy.py`** — 每窗口从3题改为4题（1新学+2复习+1错题集）
+  - 新增 `select_wrong_kana()` 函数，从历史错题池中优先选错题次数多的假名
+  - 新增 `wrong_per_window` 配置参数
+  - `generate_questions_for_window()` 支持 `isWrong` 标记
+  - `build_push_message()` 支持标签显示「【错题】」和「错题回顾」提示段
+  - 回复格式改为 `1A 2B 3C 4D（共4题）`
+  - 每天3个窗口共计12题，其中3题自动来自历史错题集
+
+- **`verify-reply.py`** — 答题后自动同步错题集到 `progress.json`
+  - `update_mastered_progress()` 新增错题收集逻辑
+  - 新答错的假名自动加入 `wrongKana` 列表
+  - 重复答错自动累加 `wrongCount`，提升出题优先级
+  - 连续答对自然降低出现频率
+
+- **`configs/japanese-learning.json`** — 新增配置项
+  - `wrong_per_window: 1` 每窗口1道错题集题目
+  - `questions_per_window: 4`（原3）
+
+- **`progress.json`** — 新增 `wrongKana` 数据字段
+  - 记录19个历史错题假名及错题次数
+  - 优先级：ね(2) ち(2) る(2) れ(2) > く/よ/て/し/…(各1)
+
+---
+
 ## [1.1.3] — 2026-06-11
 
 ### 🔧 优化

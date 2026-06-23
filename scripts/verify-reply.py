@@ -157,8 +157,8 @@ def get_questions_for_verify(today_data, window_name):
         return today_data.get("questions", []), None
 
 
-def call_hunyuan_api(api_key, base_url, model, messages):
-    """调用混元 API"""
+def call_openai_compatible_api(api_key, base_url, model, messages):
+    """调用 OpenAI 兼容 Chat Completions API"""
     try:
         import requests
     except ImportError:
@@ -317,7 +317,7 @@ def llm_parse_full_message(full_message, config, questions, log_file, user_reply
 
     api_key = config["api"]["api_key"]
     base_url = config["api"]["base_url"]
-    model = config["api"].get("model", "hy3-preview")
+    model = config["api"].get("model", "deepseek-chat")
 
     log(f"调用 LLM 解析完整消息（长度: {len(full_message)} 字符）...", log_file)
     log(f"完整消息前200字符: {full_message[:200]}", log_file)
@@ -328,7 +328,7 @@ def llm_parse_full_message(full_message, config, questions, log_file, user_reply
     ]
 
     try:
-        response = call_hunyuan_api(api_key, base_url, model, messages)
+        response = call_openai_compatible_api(api_key, base_url, model, messages)
         content = response["choices"][0]["message"]["content"].strip()
         log(f"LLM 返回原始内容: {content[:500]}", log_file)
 
@@ -478,20 +478,23 @@ def update_window_data(today_data, window_name, parsed):
 
 
 def update_mastered_progress(today_data, config, log_file):
-    """根据所有窗口的答题结果更新总体进度"""
+    """根据所有窗口的答题结果更新总体进度（含错题集）"""
     progress_file = os.path.expanduser(config["workspace"]["progress_file"])
     try:
         with open(progress_file, "r", encoding="utf-8") as f:
             progress = json.load(f)
 
-        # 收集所有窗口的题目
+        # 收集所有窗口的题目和结果
         all_questions = []
+        all_results = []
         if is_new_format(today_data):
             for w_name in ["morning", "afternoon", "evening"]:
                 w = today_data["windows"].get(w_name, {})
                 all_questions.extend(w.get("questions", []))
+                all_results.extend(w.get("questionResults", []))
         else:
             all_questions = today_data.get("questions", [])
+            all_results = today_data.get("questionResults", [])
 
         # 添加今日学习的假名到 mastered（去重）
         for q in all_questions:
@@ -502,12 +505,64 @@ def update_mastered_progress(today_data, config, log_file):
                 progress["mastered"].append(kana)
 
         progress["masteredCount"] = len(progress["mastered"])
+
+        # === 更新错题集（wrongKana）===
+        # 收集答错的假名
+        wrong_in_window = set()
+        for r in all_results:
+            if not r.get("isCorrect"):
+                hira = r.get("kana") or r.get("kanaHira", "")
+                if hira:
+                    wrong_in_window.add(hira)
+
+        # 用 kana-data.json 补全错题数据
+        kana_data_file = os.path.expanduser(config.get("workspace", {}).get("kana_data", ""))
+        kana_lookup = {}
+        if kana_data_file and os.path.isfile(kana_data_file):
+            try:
+                with open(kana_data_file, "r", encoding="utf-8") as kf:
+                    kd = json.load(kf)
+                for row in kd.get("rows", []):
+                    for k in row.get("kana", []):
+                        kana_lookup[k["hiragana"]] = {
+                            "kata": k["katakana"],
+                            "romaji": k["romaji"]
+                        }
+            except Exception:
+                pass
+
+        if "wrongKana" not in progress:
+            progress["wrongKana"] = []
+
+        existing_wrong_map = {w["hira"]: w for w in progress["wrongKana"]}
+
+        for hira in wrong_in_window:
+            if hira in existing_wrong_map:
+                # 已存在，增加错题次数
+                existing_wrong_map[hira]["wrongCount"] = existing_wrong_map[hira].get("wrongCount", 0) + 1
+            else:
+                # 新增错题记录
+                info = kana_lookup.get(hira, {"kata": "", "romaji": ""})
+                progress["wrongKana"].append({
+                    "hira": hira,
+                    "kata": info["kata"],
+                    "romaji": info["romaji"],
+                    "wrongCount": 1
+                })
+
+        # 按错题次数排序
+        progress["wrongKana"].sort(key=lambda x: x.get("wrongCount", 1), reverse=True)
+
         progress["lastUpdateTime"] = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         with open(progress_file, "w", encoding="utf-8") as f:
             json.dump(progress, f, ensure_ascii=False, indent=2)
 
         log(f"总体进度已更新: masteredCount={progress['masteredCount']}", log_file)
+        if wrong_in_window:
+            log(f"错题集更新: {wrong_in_window}", log_file)
+        else:
+            log(f"本轮无新增错题", log_file)
     except Exception as e:
         log(f"⚠️ 更新总体进度失败: {e}", log_file)
 
