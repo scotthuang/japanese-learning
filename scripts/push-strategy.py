@@ -698,10 +698,18 @@ def main():
         # 选择错题集假名（优先错题，排除当天已用的错题假名）
         selected_wrong = select_wrong_kana(all_kana, wrong_kana_list, used_wrong, wrong_per_window)
 
-        # 边界处理：如果没有新学假名了
+        # 边界处理：如果没有新学假名了，多选一个复习凑满4题
         if not selected_new:
-            log("⚠️ 没有新的假名可学，本次错题集+复习", log_file)
-            # 不填充新学位置，仍然用复习+错题
+            log("⚠️ 没有新的假名可学，用复习补位凑满4题", log_file)
+            # 补选一个复习凑满4题（3复习+1错题）
+            extra_count = 1
+            extra_review = select_review_kana(all_kana, mastered, used_review, suggested_review_hira, extra_count)
+            if extra_review:
+                selected_review = list(selected_review) + extra_review
+                # 更新当天已用复习假名列表
+                for k in extra_review:
+                    used_review.add(k["hiragana"])
+                log(f"补选复习: {[k['hiragana'] for k in extra_review]}", log_file)
 
         # 边界处理：如果没有复习假名
         if not selected_review:
