@@ -1,11 +1,11 @@
 ---
 name: japanese-learning
-description: 日语五十音学习系统。当用户回复五十音练习答案（格式如"1A 2B 3C"），或消息包含"请使用日语学习Skill"时触发。Skill 自己用 LLM 推理解析完整消息，判断对错并更新数据。
+description: 日语学习系统。当用户回复练习答案（格式如"1A 2B 3C 4D"），或消息包含"请使用日语学习Skill"时触发。系统支持五十音题和单词识读题，并更新 daily/progress 数据。
 ---
 
 # 日语学习 Skill
 
-处理用户回复、自己判断对错、更新档案、返回结果。
+处理用户回复、判断对错、更新档案、返回结果。46 个基础假名完成后，推送自动进入单词模式。
 
 ## 目录结构
 
@@ -31,7 +31,8 @@ description: 日语五十音学习系统。当用户回复五十音练习答案�
         └── scripts/               # 逻辑脚本
             ├── push-strategy.py    # 推送策略（生成题目ID）
             ├── infer-progress.py   # 进度推理
-            ├── verify-reply.py     # ✅ 答案验证（大改造！用LLM推理）
+            ├── verify-reply.py     # 答案验证（确定性解析 + 旧 LLM 兼容）
+            ├── gen-word-questions.py # 单词题生成
             ├── gen-questions.py    # 问题生成
             ├── select-kana.py      # 假名选择
             ├── verify-config.py    # 配置验证
@@ -55,10 +56,10 @@ description: 日语五十音学习系统。当用户回复五十音练习答案�
 3. **用双参数方式调用 Skill**（推荐）：
    ```bash
    python3 ~/.openclaw/workspace/skills/japanese-learning/scripts/verify-reply.py \
-     --user-reply "1A 2B 3C" \
+     --user-reply "1A 2B 3C 4D" \
      --full-message "引用推送消息..."
    ```
-   > ⚠️ **重要**：`--user-reply` 只传用户的实际答案（如 `1C 2B 3B`），
+   > **重要**：`--user-reply` 只传用户的实际答案（如 `1C 2B 3B 4D`），
    > 不要把引用消息中的正确答案误填进去！Skill 脚本自己有题目和正确答案数据，
    > 会自动判断对错，你只需如实传递用户输入即可。
 4. **等待 Skill 输出结果**，直接返回给用户，不要自己生成回复！
@@ -102,7 +103,7 @@ Q1 ✅
 Q2 ❌ (正确答案: A)
 Q3 ✅
 
-📊 今日正确率: 66.67% (2/3)
+📊 本次正确率: 75.00% (3/4)
 👍 不错，再接再厉！
 ```
 
@@ -221,14 +222,14 @@ A2: ri - りんご（苹果）
 ### verify-reply.py（核心！）
 
 **参数：**
-- `--user-reply`（推荐，可选）：用户回复的答案字符串（如 `"1A 2B 3C"`）
+- `--user-reply`（推荐，可选）：用户回复的答案字符串（如 `"1A 2B 3C 4D"`）
 - `--full-message`（可选）：引用推送消息上下文（题目、选项等）
 - 至少需要提供其中一个；推荐两个都传，分离用户答案和引用上下文
 
 **推荐调用方式（双参数）：**
 ```bash
 python3 ~/.openclaw/workspace/skills/japanese-learning/scripts/verify-reply.py \
-  --user-reply "1A 2B 3C" \
+  --user-reply "1A 2B 3C 4D" \
   --full-message "【提问 1】(ID: q_20260523_001) ..."
 ```
 
@@ -241,9 +242,8 @@ python3 ~/.openclaw/workspace/skills/japanese-learning/scripts/verify-reply.py \
 **内部流程：**
 1. 解析 `--user-reply`（如有）提取用户答案，解析 `--full-message`（如有）获取上下文
 2. 读取配置文件（获取 API key、日志路径）
-3. 调用混元 API（用 LLM 推理）匹配答案和判断对错
-   - 如果提供了 `--user-reply`，用户答案已明确，LLM 只需匹配和判断
-   - 如果只有 `--full-message`，LLM 自行从完整消息中提取答案（向后兼容）
+3. 如果提供了 `--user-reply`，脚本直接根据 daily 中保存的题目判分
+   - 如果只有 `--full-message`，才调用 DeepSeek 兼容 API 解析完整消息（向后兼容）
    - Prompt 要求返回结构化 JSON（含 questionResults）
 4. 读取目标档案 `daily/YYYY-MM-DD.json`
 5. 更新档案中对应窗口的数据：
@@ -254,9 +254,9 @@ python3 ~/.openclaw/workspace/skills/japanese-learning/scripts/verify-reply.py \
 
 **`--user-reply` 字符串格式：**
 ```
-1A 2B 3C
+1A 2B 3C 4D
 ```
-支持空格分隔或连写（如 `1A2B3C`），答案字母支持 A/B/C（大小写均可）。
+支持空格分隔或连写（如 `1A2B3C4D`），答案字母支持 A/B/C/D（大小写均可）。
 
 **`--full-message` 字符串格式（作为引用上下文）：**
 ```
@@ -330,29 +330,28 @@ A. ナ  B. ニ  C. ヌ
 - ✅ `questions` 数组包含题目ID、kana、answer
 - ✅ 新增 `questionResults` 数组，记录每道题详细结果
 - ✅ 方便统计哪个五十音对了/错了
+- ✅ 单词题使用 `type: "word"`，并记录 `word`、`correctKana`、`wrongKana`、`selectedRomaji`
 
 ---
 
-## 推送消息格式（已更新）
+## 单词模式推送格式
 
 ```
-五十音练习 🎌 第1天
-
-今日学习：な ろ を
+日语练习 🎌 第X天
 
 【教学】
-平假名：な ろ を
-片假名：ナ ロ ヲ
-读音：na ro o
-💡 联想：...
+新单词：
+ねこ (neko) 🐱 猫
+つくえ (tsukue) 🪵 桌子
 
 【提问】
-1. (ID: q_20260523_001) 【提问】平假名「な」的片假名是？
-   A. ナ  B. ニ  C. ヌ
+1. (ID: w_20260706_morning_001) 「ねこ」怎么读？
+   A. neko 🐱 猫
+   B. inu 🐶 狗
+   C. hana 🌸 花
+   D. kumo ☁️ 云
 
-2. (ID: q_20260523_002) ...
-
-回复格式：1A 2B 3C
+回复格式：1A 2B 3C 4D
 ---
 请使用日语学习Skill
 ```
@@ -365,8 +364,8 @@ A. ナ  B. ニ  C. ヌ
 
 ### 学习模式
 - ✅ LLM **只负责传话**，不判断对错
-- ✅ Skill（verify-reply.py）**自己用 LLM 推理**解析消息
-- ✅ 不用正则，用 LLM 推理适应未来消息格式变化
+- ✅ Skill（verify-reply.py）在提供 `--user-reply` 时确定性判分
+- ✅ 旧式完整消息仍可回退到 DeepSeek 解析
 - ✅ 今日档案包含 `questionResults`，记录详细结果
 - ✅ 日志路径从配置文件读取，Skill 自己推理今日档案路径
 
@@ -387,12 +386,16 @@ A. ナ  B. ニ  C. ヌ
 | `workspace.root` | 日语学习数据根目录 | `~/.openclaw/workspace/japanese-learning` |
 | `logs.dir` | 日志根目录 | `~/.openclaw/workspace/logs/japanese-learning` |
 | `logs.main_log` | 主日志文件路径 | `~/.openclaw/workspace/logs/japanese-learning/main.log` |
-| `api.model` | 使用的混元模型 | `hy3-preview` |
+| `workspace.word_data` | 单词库路径 | `~/.openclaw/workspace/japanese-learning/word-data.json` |
+| `api.model` | 使用的 DeepSeek 模型 | `deepseek-chat` |
 | `api.api_key` | API key（已配置） | `***` |
 | `push_strategy.interval_seconds` | 心跳间隔（秒） | `1800`（30分钟） |
-| `push_strategy.questions_per_window` | 每窗口题目数 | `3` |
+| `push_strategy.questions_per_window` | 每窗口题目数 | `4` |
 | `push_strategy.new_per_window` | 每窗口新学数 | `1` |
 | `push_strategy.review_per_window` | 每窗口复习数 | `2` |
+| `push_strategy.word_new_per_window` | 单词模式每窗口新词数 | `2` |
+| `push_strategy.word_review_per_window` | 单词模式每窗口旧词数 | `1` |
+| `push_strategy.word_wrong_per_window` | 单词模式每窗口错题词数 | `1` |
 | `push_strategy.windows.morning` | 早间窗口(08-12) | `🌅 早间推送` |
 | `push_strategy.windows.afternoon` | 午间窗口(13-17) | `☀️ 午间推送` |
 | `push_strategy.windows.evening` | 晚间窗口(19-22) | `🌙 晚间推送` |
@@ -415,7 +418,7 @@ python3 ~/.openclaw/workspace/skills/japanese-learning/scripts/verify-config.py
 **改造完成！** 🎉  
 - ✅ 推送生成题目ID
 - ✅ SKILL.md 简化触发条件
-- ✅ verify-reply.py 大改造（用 LLM 推理）
+- ✅ verify-reply.py 支持确定性判分和旧式 LLM 解析
 - ✅ 今日档案新增 questionResults
 - ✅ LLM 只传话，不判断对错
 

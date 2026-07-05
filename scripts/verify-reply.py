@@ -9,7 +9,8 @@
 - --user-reply 接收用户回复字符串（如 "1C 2B 3B"），可选
 - --full-message 接收引用消息上下文，可选（如果传了作为引用上下文）
 - 至少需要提供 --user-reply 或 --full-message 之一
-- 用 LLM 推理解析完整消息（不用正则）
+- 提供 --user-reply 时按 daily 中保存的答案确定性判分
+- 仅在旧式完整消息解析时回退到 LLM
 - 匹配回复到正确的窗口（morning/afternoon/evening）
 - 更新 daily/*.json 中对应窗口的 questionResults 等字段
 - 向后兼容旧格式（扁平 pushed/replied）
@@ -55,7 +56,7 @@ def parse_user_reply(user_reply):
         return result
 
     # 匹配 "1A" "2B" "3C" 等格式（支持空格分隔或连写如 "1A2B3C"）
-    pattern = re.findall(r'(\d+)\s*([A-Ca-c])', user_reply)
+    pattern = re.findall(r'(\d+)\s*([A-Da-d])', user_reply)
     for num, letter in pattern:
         result[int(num)] = letter.upper()
 
@@ -79,8 +80,8 @@ def find_target_file_and_window(config, full_message):
     daily_dir = os.path.expanduser(config["workspace"]["daily_dir"])
     target_window = None
 
-    # 尝试从题目ID中提取日期和窗口（新格式：q_20260608_morning_001）
-    id_match = re.search(r'q_(\d{8})_(\w+)_\d+', full_message)
+    # 尝试从题目ID中提取日期和窗口（新格式：q_20260608_morning_001 / w_20260608_morning_001）
+    id_match = re.search(r'[qw]_(\d{8})_(\w+)_\d+', full_message)
     if id_match:
         date_str = id_match.group(1)
         target_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
@@ -90,7 +91,7 @@ def find_target_file_and_window(config, full_message):
             return target_file, target_date, target_window
 
     # 尝试从题目ID中提取日期（旧格式：q_20260608_001，无窗口名）
-    id_match = re.search(r'q_(\d{8})_(\d+)', full_message)
+    id_match = re.search(r'[qw]_(\d{8})_(\d+)', full_message)
     if id_match:
         date_str = id_match.group(1)
         target_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
@@ -188,6 +189,90 @@ def call_openai_compatible_api(api_key, base_url, model, messages):
         return resp.json()
     except Exception as e:
         raise RuntimeError(f"API 调用失败: {e}")
+
+
+def parse_word_option(option):
+    """Parse an option like 'neko 🐱 猫' into romaji/meaning/emoji-ish text."""
+    parts = option.split(maxsplit=2)
+    return {
+        "romaji": parts[0] if parts else "",
+        "display": option,
+        "meaning": parts[2] if len(parts) >= 3 else "",
+    }
+
+
+def deterministic_parse_user_reply(user_reply, questions, log_file):
+    """Build verification results directly from stored questions and answer letters."""
+    answers = parse_user_reply(user_reply)
+    if not answers:
+        return None
+
+    results = []
+    correct_count = 0
+    for idx, q in enumerate(questions, 1):
+        user_answer = answers.get(idx, "?")
+        correct_answer = q.get("answer", "?")
+        is_correct = user_answer == correct_answer
+        if is_correct:
+            correct_count += 1
+
+        q_type = q.get("type", "hira2kata")
+        result = {
+            "questionId": q.get("id", f"q_unknown_{idx:03d}"),
+            "question": q.get("q", ""),
+            "type": q_type,
+            "userAnswer": user_answer,
+            "correctAnswer": correct_answer,
+            "isCorrect": is_correct,
+            "isReview": q.get("isReview", False),
+            "isWrong": q.get("isWrong", False),
+        }
+
+        options = q.get("options", [])
+        selected = ""
+        if len(user_answer) == 1 and user_answer.isalpha():
+            opt_idx = ord(user_answer.upper()) - ord("A")
+            if 0 <= opt_idx < len(options):
+                selected = options[opt_idx]
+
+        if q_type == "word":
+            option_words = q.get("optionWords", [])
+            selected_word = {}
+            if len(user_answer) == 1 and user_answer.isalpha():
+                opt_idx = ord(user_answer.upper()) - ord("A")
+                if 0 <= opt_idx < len(option_words):
+                    selected_word = option_words[opt_idx]
+            parsed_option = parse_word_option(selected) if selected else {}
+            result.update({
+                "word": q.get("word") or q.get("hiragana", ""),
+                "correctKana": q.get("word") or q.get("hiragana", ""),
+                "wrongKana": selected_word.get("hiragana", "") if not is_correct else "",
+                "romaji": q.get("romaji", ""),
+                "meaning": q.get("meaning", ""),
+                "emoji": q.get("emoji", ""),
+                "selectedRomaji": selected_word.get("romaji") or parsed_option.get("romaji", ""),
+                "selectedMeaning": selected_word.get("meaning") or parsed_option.get("meaning", ""),
+            })
+        else:
+            result.update({
+                "kana": q.get("kana", ""),
+                "kanaHira": q.get("kana", ""),
+                "kanaKata": q.get("kanaKata", ""),
+                "romaji": q.get("romaji", ""),
+                "userAnswerKana": selected,
+                "userAnswerRomaji": "",
+            })
+        results.append(result)
+
+    accuracy = round(correct_count / len(questions) * 100, 2) if questions else 0
+    parsed = {
+        "userReply": user_reply,
+        "questionResults": results,
+        "correctCount": correct_count,
+        "accuracy": accuracy,
+    }
+    log(f"确定性解析完成: correctCount={correct_count}, accuracy={accuracy}", log_file)
+    return parsed
 
 
 def llm_parse_full_message(full_message, config, questions, log_file, user_reply=""):
@@ -401,6 +486,21 @@ def format_output(parsed, questions):
         q_id = r.get("questionId", "")
         # 从 question 列表查找题目详情
         q_detail = qid_to_question.get(q_id, {})
+        if (r.get("type") or q_detail.get("type")) == "word":
+            word = r.get("word") or q_detail.get("word") or q_detail.get("hiragana", "")
+            romaji = r.get("romaji") or q_detail.get("romaji", "")
+            meaning = r.get("meaning") or q_detail.get("meaning", "")
+            emoji = r.get("emoji") or q_detail.get("emoji", "")
+            if r.get("isCorrect"):
+                lines.append(f"Q{q_num} 题目：{word} ({romaji}) {emoji} {meaning} ✅")
+            else:
+                selected_romaji = r.get("selectedRomaji", "")
+                selected_meaning = r.get("selectedMeaning", "")
+                lines.append(f"Q{q_num} 题目：{word} ({romaji}) {emoji} {meaning}")
+                lines.append(f"  你的答案：{selected_romaji} {selected_meaning} ❌")
+                lines.append(f"  正确答案：{romaji} {meaning} ✅")
+            continue
+
         kanaHira = r.get("kanaHira", "") or q_detail.get("kana", "")
         kanaKata = r.get("kanaKata", "") or q_detail.get("kanaKata", "")
         romaji = r.get("romaji", "") or q_detail.get("romaji", "")
@@ -498,6 +598,8 @@ def update_mastered_progress(today_data, config, log_file):
 
         # 添加今日学习的假名到 mastered（去重）
         for q in all_questions:
+            if q.get("type") == "word":
+                continue
             kana = q.get("kana", "")
             if kana and kana not in progress.get("mastered", []):
                 if "mastered" not in progress:
@@ -506,10 +608,60 @@ def update_mastered_progress(today_data, config, log_file):
 
         progress["masteredCount"] = len(progress["mastered"])
 
+        # === 更新单词学习进度 ===
+        if "wordMastered" not in progress:
+            progress["wordMastered"] = []
+        if "wordWrongList" not in progress:
+            progress["wordWrongList"] = []
+        if "wordIntroduced" not in progress:
+            progress["wordIntroduced"] = []
+
+        word_wrong_map = {
+            (w.get("hiragana") or w.get("word")): w
+            for w in progress.get("wordWrongList", [])
+            if w.get("hiragana") or w.get("word")
+        }
+        word_mastered = set(progress.get("wordMastered", []))
+        word_introduced = set(progress.get("wordIntroduced", []))
+
+        for q in all_questions:
+            if q.get("type") == "word":
+                word_introduced.add(q.get("word") or q.get("hiragana", ""))
+
+        for r in all_results:
+            if r.get("type") != "word":
+                continue
+            word = r.get("word") or r.get("correctKana", "")
+            if not word:
+                continue
+            if r.get("isCorrect"):
+                word_mastered.add(word)
+            else:
+                existing = word_wrong_map.get(word)
+                if existing:
+                    existing["wrongCount"] = existing.get("wrongCount", 0) + 1
+                else:
+                    item = {
+                        "hiragana": word,
+                        "romaji": r.get("romaji", ""),
+                        "meaning": r.get("meaning", ""),
+                        "emoji": r.get("emoji", ""),
+                        "wrongCount": 1,
+                    }
+                    progress["wordWrongList"].append(item)
+                    word_wrong_map[word] = item
+
+        progress["wordIntroduced"] = sorted([w for w in word_introduced if w])
+        progress["wordMastered"] = sorted([w for w in word_mastered if w])
+        progress["wordMasteredCount"] = len(progress["wordMastered"])
+        progress["wordWrongList"].sort(key=lambda x: x.get("wrongCount", 1), reverse=True)
+
         # === 更新错题集（wrongKana）===
         # 收集答错的假名
         wrong_in_window = set()
         for r in all_results:
+            if r.get("type") == "word":
+                continue
             if not r.get("isCorrect"):
                 hira = r.get("kana") or r.get("kanaHira", "")
                 if hira:
@@ -558,7 +710,7 @@ def update_mastered_progress(today_data, config, log_file):
         with open(progress_file, "w", encoding="utf-8") as f:
             json.dump(progress, f, ensure_ascii=False, indent=2)
 
-        log(f"总体进度已更新: masteredCount={progress['masteredCount']}", log_file)
+        log(f"总体进度已更新: masteredCount={progress['masteredCount']}, wordMasteredCount={progress.get('wordMasteredCount', 0)}", log_file)
         if wrong_in_window:
             log(f"错题集更新: {wrong_in_window}", log_file)
         else:
@@ -631,9 +783,9 @@ def main():
     # 如果未确定窗口，尝试从题目ID匹配
     if not matched_window and is_new_format(today_data):
         # 从消息中提取所有题目ID
-        qid_pattern = re.findall(r'q_\d{8}_\w+_\d+', full_message)
+        qid_pattern = re.findall(r'[qw]_\d{8}_\w+_\d+', full_message)
         if not qid_pattern:
-            qid_pattern = re.findall(r'q_\d{8}_\d+', full_message)
+            qid_pattern = re.findall(r'[qw]_\d{8}_\d+', full_message)
         if qid_pattern:
             matched_window = match_reply_to_window(today_data, set(qid_pattern))
             if matched_window:
@@ -657,13 +809,15 @@ def main():
         print("❌ 未找到可回答的题目")
         sys.exit(1)
 
-    # 用 LLM 推理解析完整消息
-    try:
-        parsed = llm_parse_full_message(full_message, config, questions, log_file, user_reply)
-    except Exception as e:
-        log(f"❌ LLM 推理失败: {e}", log_file)
-        print(f"❌ 答案解析失败，请稍后重试或联系管理员")
-        sys.exit(1)
+    parsed = deterministic_parse_user_reply(user_reply, questions, log_file) if user_reply else None
+    if parsed is None:
+        # 用 LLM 推理解析完整消息（兼容旧方式）
+        try:
+            parsed = llm_parse_full_message(full_message, config, questions, log_file, user_reply)
+        except Exception as e:
+            log(f"❌ LLM 推理失败: {e}", log_file)
+            print(f"❌ 答案解析失败，请稍后重试或联系管理员")
+            sys.exit(1)
 
     # 验证解析结果
     results = parsed.get("questionResults", [])
@@ -688,6 +842,13 @@ def main():
                 r["kanaKata"] = q_detail.get("kanaKata", "")
             if not r.get("romaji"):
                 r["romaji"] = q_detail.get("romaji", "")
+            if "type" not in r:
+                r["type"] = q_detail.get("type", "hira2kata")
+            if q_detail.get("type") == "word":
+                r.setdefault("word", q_detail.get("word") or q_detail.get("hiragana", ""))
+                r.setdefault("correctKana", q_detail.get("word") or q_detail.get("hiragana", ""))
+                r.setdefault("meaning", q_detail.get("meaning", ""))
+                r.setdefault("emoji", q_detail.get("emoji", ""))
 
     if len(results) != len(questions):
         log(f"⚠️ 解析结果数量({len(results)})与题目数量({len(questions)})不匹配", log_file)

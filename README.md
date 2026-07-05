@@ -1,4 +1,4 @@
-# 日语五十音学习 Skill
+# 日语学习 Skill
 
 > 作者：Shadow 🦊
 > 创建时间：2026-05-23
@@ -6,43 +6,44 @@
 
 ---
 
-## 📋 概述
+## 概述
 
-一套完整的日语五十音（假名）学习系统，集成在 OpenClaw 中，支持自动推送、答案验证、每日沉淀、个性化学习方案。
+一套集成在 OpenClaw 中的日语学习系统。当前已从纯五十音升级为「五十音 + 单词混排」：46 个基础假名完成后，推送自动切换到单词识读题，用高频纯平假名单词继续巩固假名读音。
 
 ---
 
-## ✨ 核心功能
+## 核心功能
 
-### 1️⃣ 自动推送（心跳触发）
-- 每 30 分钟心跳检查，30% 概率推送
-- 每次推送 **5 道题**（3 道新学 + 2 道复习）
-- 知识卡片：**3 个新学假名** + **日语单词**（如 あ→アパート「公寓」）
+### 1. 自动推送
+- 每 30 分钟心跳检查当前时间窗口
+- 每天 3 个窗口：早间、午间、晚间
+- 五十音完成前：假名题
+- 五十音完成后：单词题，每窗口目标为 2 新词 + 1 旧词复习 + 1 错题复习
 
-### 2️⃣ 混合出题
-- 新学题：对应卡片上的假名
-- 复习题：从已掌握列表出题，**不显示在卡片里**
-- 题型随机：平假名↔片假名↔读音
+### 2. 单词识读题
+- 展示平假名单词，选择对应罗马音
+- 选项同时包含中文释义和 emoji
+- 题目保存为 `type: "word"`，题目 ID 为 `w_YYYYMMDD_window_001`
 
-### 3️⃣ 答案验证
-- 使用 LLM（混元 API）解析用户回复
-- 自动验证答案、更新每日档案
-- 即时反馈：🎉 全对！/ 💪 继续加油
+### 3. 答案验证
+- 推荐传入 `--user-reply`，脚本按 daily 中保存的答案确定性判分
+- 兼容旧的 `--full-message` LLM 解析方式
+- 单词错题写入 `progress.json` 的 `wordWrongList`
 
-### 4️⃣ 每日沉淀（凌晨 1:30 cron）
+### 4. 每日沉淀
 - 分析所有历史答题详情
 - 生成 `learning-profile.md`（个人学习档案）
 - 生成 `next-day-plan.json`（第二天学习方案）
 - 自动推送完成通知
 
-### 5️⃣ 个性化学习方案
+### 5. 个性化学习方案
 - **第二天方案**：推荐新学哪些行、巩固哪些假名
 - `push-strategy.py` 直接读取方案出题
 - 精准复习：根据正确率推荐易错假名
 
 ---
 
-## 📂 文件结构
+## 文件结构
 
 ```
 japanese-learning/
@@ -52,13 +53,15 @@ japanese-learning/
 ├── README.md            # 本文件
 ├── .gitignore           # Git 忽略规则
 ├── scripts/            # 脚本目录
-│   ├── push-strategy.py      # 推送脚本（3 新学 + 2 复习）
-│   ├── verify-reply.py       # 答案验证（LLM 解析）
+│   ├── push-strategy.py      # 推送脚本（假名模式/单词模式自动切换）
+│   ├── gen-word-questions.py # 单词题生成
+│   ├── verify-reply.py       # 答案验证
 │   ├── infer-progress.py     # 每日沉淀（分析历史、生成档案）
 │   ├── gen-questions.py     # 题目生成
 │   └── select-kana.py      # 假名选择
 └── (数据文件在 workspace/japanese-learning/)
-    ├── kana-data.json         # 46 个假名数据（含日语单词）
+    ├── kana-data.json         # 46 个假名数据
+    ├── word-data.json         # 高频纯平假名单词库
     ├── progress.json          # 总体进度
     ├── learning-profile.md    # 个人学习档案
     ├── next-day-plan.json    # 第二天方案
@@ -68,14 +71,14 @@ japanese-learning/
 
 ---
 
-## 🚀 快速开始
+## 快速开始
 
 ### 1. 安装
 将 `japanese-learning` 目录放到 `~/.openclaw/workspace/skills/` 下。
 
 ### 2. 配置
 编辑 `~/.openclaw/workspace/configs/japanese-learning.json`，配置：
-- API Key（混元 API）
+- API Key（DeepSeek API）
 - 微信推送参数（channel、target）
 - 推送策略（概率、冷却时间）
 
@@ -84,26 +87,36 @@ japanese-learning/
 python3 ~/.openclaw/workspace/skills/japanese-learning/scripts/push-strategy.py
 ```
 
-### 4. 测试验证
-回复消息：「1A 2B 3C 4D 5E\n请使用日语学习Skill」
+### 4. 测试单词题生成
+```bash
+python3 ~/.openclaw/workspace/skills/japanese-learning/scripts/gen-word-questions.py \
+  --new 2 --review 1 --wrong 1 --date 2026-07-06 --window morning
+```
 
-### 5. 查看档案
+### 5. 测试验证
+```bash
+python3 ~/.openclaw/workspace/skills/japanese-learning/scripts/verify-reply.py \
+  --user-reply "1A 2B 3C 4D" \
+  --full-message "引用的推送消息..."
+```
+
+### 6. 查看档案
 ```bash
 cat ~/.openclaw/workspace/japanese-learning/learning-profile.md
 ```
 
 ---
 
-## 📅 定时任务
+## 定时任务
 
 | 时间 | 任务 | 说明 |
 |------|------|------|
-| **每 30 分钟** | 心跳检查 | 30% 概率推送五十音练习 |
+| **每 30 分钟** | 心跳检查 | 落在窗口内推送练习 |
 | **每天 01:30** | 每日沉淀 | 分析历史、更新学习档案、生成第二天方案 |
 
 ---
 
-## 🔄 数据流转
+## 数据流转
 
 ```
 用户回复
@@ -123,11 +136,11 @@ push-strategy.py 读取方案
 
 ---
 
-## 🎯 当前状态（2026-05-23）
+## 当前状态（2026-07-06）
 
-- ✅ 已掌握：**ひ、り、ら**（3/46，100% 正确率）
-- ✅ 第二天方案：推荐学 **あ行**（あ、い、う、え、お）
-- ✅ Git 仓库：已初始化，master 分支
+- 已掌握：46/46 个基础假名
+- 当前默认进入单词模式
+- 单词库：58 个 2-4 假名的高频纯平假名单词，覆盖全部基础假名
 
 ---
 
@@ -141,7 +154,16 @@ push-strategy.py 读取方案
 
 ---
 
-## 📝 更新日志
+## 更新日志
+
+### 2026-07-06 — 📖 从五十音模式升级为单词模式
+- **核心变更**：50音全部学完后，推送策略自动切换到「单词模式」
+- 每个窗口：2 个新单词识读题 + 1 个旧词复习 + 1 个错题复习
+- 新增 `word-data.json`（58 个 2-4 假名高频纯平假名单词）
+- 新增 `scripts/gen-word-questions.py`（单词识读题生成）
+- `push-strategy.py` 支持假名完成自动切换单词模式
+- `verify-reply.py` 支持 `type: "word"`、`wordMastered` 和 `wordWrongList`
+- 清空旧 `wrongKana`，修复 `masteredByRow`（46/46）
 
 ### 2026-05-23
 - ✅ 完成五十音学习系统基础架构
@@ -156,4 +178,4 @@ push-strategy.py 读取方案
 
 ---
 
-*此文档由 Shadow 🦊 维护，最后更新：2026-05-23 20:20*
+*最后更新：2026-07-06*

@@ -109,6 +109,12 @@ def get_used_kana_in_today(today_data):
                         used_new.add(kana)
     return used_new, used_review, used_wrong
 
+def is_kana_complete(progress, all_kana):
+    """Return True when all base kana have already been introduced/mastered."""
+    mastered = set(progress.get("mastered", []))
+    all_hira = {k["hiragana"] for k in all_kana}
+    return len(mastered & all_hira) >= len(all_hira)
+
 def init_today_file(today, day_number):
     """初始化今日档案（3个窗口都为空）"""
     return {
@@ -458,6 +464,60 @@ def build_push_message(selected_new, selected_review, selected_wrong, questions,
 
     return "\n".join(lines)
 
+def generate_word_questions(config, today_file, today, window_name, new_count=2, review_count=1, wrong_count=1):
+    """Call the standalone word generator and return its JSON payload."""
+    script = os.path.join(os.path.dirname(__file__), "gen-word-questions.py")
+    cmd = [
+        sys.executable,
+        script,
+        "--new", str(new_count),
+        "--review", str(review_count),
+        "--wrong", str(wrong_count),
+        "--date", today,
+        "--window", window_name,
+        "--today-file", today_file,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "gen-word-questions.py failed")
+    return json.loads(result.stdout)
+
+def build_word_push_message(payload, questions, window_name, day_number):
+    """构建单词模式微信推送消息"""
+    window_label = get_window_label(window_name)
+    lines = [f"{window_label} — 日语练习 🎌 第{day_number}天", ""]
+
+    teaching_words = payload.get("teachingWords", [])
+    if teaching_words:
+        lines.append("【教学】")
+        lines.append("新单词：")
+        for w in teaching_words:
+            lines.append(f"{w['hiragana']} ({w['romaji']}) {w.get('emoji', '')} {w['meaning']}")
+
+    review_words = payload.get("reviewWords", [])
+    if review_words:
+        lines.append("")
+        lines.append("【旧词复习】" + "、".join([f"{w['hiragana']} ({w['romaji']})" for w in review_words]))
+
+    wrong_words = payload.get("wrongWords", [])
+    if wrong_words:
+        lines.append("")
+        lines.append("【错题回顾】" + "、".join([f"{w['hiragana']} ({w['romaji']})" for w in wrong_words]))
+
+    lines.append("")
+    lines.append("【提问】")
+    for i, q in enumerate(questions, 1):
+        lines.append(f"{i}. (ID: {q['id']}) {q['q']}")
+        for j, opt in enumerate(q["options"]):
+            lines.append(f"   {chr(65 + j)}. {opt}")
+
+    answer_hint = " ".join([f"{i}{chr(64 + i)}" for i in range(1, len(questions) + 1)])
+    lines.append("")
+    lines.append(f"回复格式：{answer_hint}")
+    lines.append("---")
+    lines.append("请使用日语学习Skill")
+    return "\n".join(lines)
+
 def generate_daily_summary(config, log_file):
     """生成每日学习总结（昨日答题情况）"""
     daily_dir = os.path.expanduser(config["workspace"]["daily_dir"])
@@ -671,6 +731,73 @@ def main():
                 all_kana.append(k)
 
         mastered = set(progress.get("mastered", []))
+        word_mode = is_kana_complete(progress, all_kana)
+        log(f"当前学习模式: {'word' if word_mode else 'kana'}", log_file)
+
+        if word_mode:
+            try:
+                payload = generate_word_questions(
+                    config,
+                    today_file,
+                    today,
+                    current_window,
+                    new_count=push_config.get("word_new_per_window", 2),
+                    review_count=push_config.get("word_review_per_window", 1),
+                    wrong_count=push_config.get("word_wrong_per_window", 1),
+                )
+            except Exception as e:
+                log(f"❌ 单词题生成失败: {e}", log_file)
+                sys.exit(1)
+
+            questions = payload.get("questions", [])
+            if not questions:
+                log("❌ 单词模式未生成任何题目，跳过推送", log_file)
+                sys.exit(1)
+
+            msg = build_word_push_message(payload, questions, current_window, day_number)
+            log(f"推送消息：\n{msg}", log_file)
+
+            cmd = [
+                openclaw_bin, "message", "send",
+                "--channel", channel,
+                "--target", target,
+                "--message", msg,
+            ]
+
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                if result.returncode == 0:
+                    log("✅ 单词模式推送成功", log_file)
+
+                    current_win_data["pushed"] = True
+                    current_win_data["pushedAt"] = now.strftime("%Y-%m-%d %H:%M")
+                    current_win_data["mode"] = "word"
+                    current_win_data["questions"] = questions
+
+                    existing_words = set(today_data.get("wordsLearned", []))
+                    for w in payload.get("teachingWords", []):
+                        existing_words.add(w["hiragana"])
+                    today_data["wordsLearned"] = sorted(existing_words)
+
+                    if all_windows_pushed(today_data):
+                        today_data["allWindowsPushed"] = True
+                        log("🎉 所有3个窗口已推送完毕！", log_file)
+
+                    save_json(today_file, today_data)
+
+                    introduced = set(progress.get("wordIntroduced", []))
+                    for w in payload.get("teachingWords", []):
+                        introduced.add(w["hiragana"])
+                    progress["wordIntroduced"] = sorted(introduced)
+                    progress["lastPushTime"] = now.strftime("%Y-%m-%d %H:%M")
+                    save_json(progress_file, progress)
+                else:
+                    log(f"❌ 推送失败: {result.stderr}", log_file)
+            except Exception as e:
+                log(f"❌ 推送异常: {e}", log_file)
+
+            log("单词模式推送流程完成", log_file)
+            return
 
         # 收集当天已用假名（现在返回3个集合）
         used_new, used_review, used_wrong = get_used_kana_in_today(today_data)
