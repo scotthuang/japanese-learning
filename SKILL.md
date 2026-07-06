@@ -5,7 +5,7 @@ description: 日语学习系统。当用户回复练习答案（格式如"1A 2B 
 
 # 日语学习 Skill
 
-处理用户回复、判断对错、更新档案、返回结果。46 个基础假名完成后，推送自动进入单词模式。
+处理用户回复、判断对错、更新档案、返回结果。46 个基础假名完成后，推送自动进入 v3.0 单词模式：白天先学新词，晚间集中测验 recall。
 
 ## 目录结构
 
@@ -32,7 +32,7 @@ description: 日语学习系统。当用户回复练习答案（格式如"1A 2B 
             ├── push-strategy.py    # 推送策略（生成题目ID）
             ├── infer-progress.py   # 进度推理
             ├── verify-reply.py     # 答案验证（确定性解析 + 旧 LLM 兼容）
-            ├── gen-word-questions.py # 单词题生成
+            ├── gen-word-questions.py # 单词学习/测验生成
             ├── gen-questions.py    # 问题生成
             ├── select-kana.py      # 假名选择
             ├── verify-config.py    # 配置验证
@@ -248,7 +248,7 @@ python3 ~/.openclaw/workspace/skills/japanese-learning/scripts/verify-reply.py \
 4. 读取目标档案 `daily/YYYY-MM-DD.json`
 5. 更新档案中对应窗口的数据：
    - `userReply`: 用户回复
-   - `questionResults`: 每道题的详细结果（题目、五十音、对错）
+   - `questionResults`: 每道题的详细结果（题目、五十音/单词、对错）
    - `correctCount`, `accuracy`, `replied=true`
 6. 输出结果给 LLM（Q1 ✅ Q2 ❌... 格式）
 
@@ -330,33 +330,58 @@ A. ナ  B. ニ  C. ヌ
 - ✅ `questions` 数组包含题目ID、kana、answer
 - ✅ 新增 `questionResults` 数组，记录每道题详细结果
 - ✅ 方便统计哪个五十音对了/错了
-- ✅ 单词题使用 `type: "word"`，并记录 `word`、`correctKana`、`wrongKana`、`selectedRomaji`
+- ✅ v3.0 单词测验使用 `type: "word-exam"`，并记录 `word`、`correctKana`、`wrongKana`、`selectedRomaji`
 
 ---
 
-## 单词模式推送格式
+## 单词模式推送格式（v3.0 先学后考）
+
+### 白天学习推送
+
+白天 3 个窗口（早间、午后、晚间）只展示新词，不出题：
 
 ```
-日语练习 🎌 第X天
+📖 午后学习 🎌 第X天
 
-【教学】
-新单词：
-ねこ (neko) 🐱 猫
-つくえ (tsukue) 🪵 桌子
+今日新词：
+おかね (オカネ) = okane 💴 钱
+らく (ラク) = raku 😌 轻松
 
-【提问】
-1. (ID: w_20260706_morning_001) 「ねこ」怎么读？
-   A. neko 🐱 猫
-   B. inu 🐶 狗
-   C. hana 🌸 花
-   D. kumo ☁️ 云
-
-回复格式：1A 2B 3C 4D
 ---
 请使用日语学习Skill
 ```
 
-**注意：** 末尾只写"请使用日语学习Skill"，不带其他说明！
+学习窗口写入 daily 的对应 `windows.<window>`：
+- `type: "study"`
+- `mode: "word-study"`
+- `studyWords`: 本窗口学习的 2 个新词
+- `questions`: 空数组
+
+### 晚间测验推送
+
+22:00 后从当天 3 次学习记录中取 6 个新词，再混入 1 个复习词和 0-1 个错题词：
+
+```
+🎯 今日总结测验 🎌 第X天
+
+【提问】
+1. (ID: w_20260707_exam_001) 「ねこ」怎么读？
+   A. neko 🐱 猫
+   B. niku 🥩 肉
+   C. neko 🐱 猫
+   D. kumo ☁️ 云
+
+回复格式：1A 2B 3C 4D 5A 6B 7C
+---
+请使用日语学习Skill
+```
+
+**注意：**
+- 考试题保存为 `type: "word-exam"`
+- 部分题目用片假名提问，训练片假名识读
+- 选项优先来自 `word-data.json` 的 `similarGroup`
+- 学习推送没有题目，不需要调用 `verify-reply.py`
+- 末尾只写"请使用日语学习Skill"，不带其他说明
 
 ---
 
@@ -394,12 +419,16 @@ A. ナ  B. ニ  C. ヌ
 | `push_strategy.new_per_window` | 每窗口新学数 | `1` |
 | `push_strategy.review_per_window` | 每窗口复习数 | `2` |
 | `push_strategy.word_new_per_window` | 单词模式每窗口新词数 | `2` |
-| `push_strategy.word_review_per_window` | 单词模式每窗口旧词数 | `1` |
-| `push_strategy.word_wrong_per_window` | 单词模式每窗口错题词数 | `1` |
-| `push_strategy.windows.morning` | 早间窗口(08-12) | `🌅 早间推送` |
-| `push_strategy.windows.afternoon` | 午间窗口(13-17) | `☀️ 午间推送` |
-| `push_strategy.windows.evening` | 晚间窗口(19-22) | `🌙 晚间推送` |
-| `push_strategy.silent_start` | 静默开始时间 | `22` |
+| `push_strategy.word_review_per_window` | 学习窗口旧词数 | `0` |
+| `push_strategy.word_wrong_per_window` | 学习窗口错题词数 | `0` |
+| `push_strategy.word_exam_new` | 晚间测验新词数 | `6` |
+| `push_strategy.word_exam_review` | 晚间测验复习词数 | `1` |
+| `push_strategy.word_exam_wrong` | 晚间测验错题词数 | `1` |
+| `push_strategy.windows.morning` | 早间学习窗口(08-11) | `🌅 早间学习` |
+| `push_strategy.windows.afternoon` | 午后学习窗口(13-16) | `☀️ 午后学习` |
+| `push_strategy.windows.evening` | 晚间学习窗口(19-21) | `🌙 晚间学习` |
+| `push_strategy.windows.exam` | 晚间测验窗口(22-23) | `🎯 晚间测验` |
+| `push_strategy.silent_start` | 静默开始时间 | `0` |
 | `push_strategy.silent_end` | 静默结束时间 | `8` |
 | `wechat.channel` | 微信推送渠道 | `openclaw-weixin` |
 

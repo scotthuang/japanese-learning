@@ -86,7 +86,7 @@ def analyze_daily_records(daily_dir, all_kana):
         # 多窗口新格式：从所有窗口中收集答题结果
         if "windows" in daily:
             results = []
-            for w_name in ["morning", "afternoon", "evening"]:
+            for w_name in ["morning", "afternoon", "evening", "exam"]:
                 w = daily.get("windows", {}).get(w_name, {})
                 results.extend(w.get("questionResults", []))
 
@@ -109,6 +109,78 @@ def analyze_daily_records(daily_dir, all_kana):
             stats["accuracy"] = None  # 未考过
     
     return kana_stats
+
+def analyze_word_records(daily_dir):
+    """Analyze word study/exam records without treating study pushes as quizzes."""
+    mastered = set()
+    wrong = {}
+    introduced = set()
+    by_day = {}
+
+    daily_files = sorted(glob.glob(os.path.join(daily_dir, "*.json")))
+    for fpath in daily_files:
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                daily = json.load(f)
+        except Exception:
+            continue
+
+        date = daily.get("date") or os.path.splitext(os.path.basename(fpath))[0]
+        day_entry = by_day.setdefault(date, {"learned": [], "examResults": {}})
+        learned_today = set(day_entry.get("learned", []))
+
+        for word in daily.get("wordsLearned", []):
+            introduced.add(word)
+            learned_today.add(word)
+
+        windows = daily.get("windows", {})
+        for w_name in ["morning", "afternoon", "evening"]:
+            for sw in windows.get(w_name, {}).get("studyWords", []):
+                hira = sw.get("hiragana")
+                if hira:
+                    introduced.add(hira)
+                    learned_today.add(hira)
+
+        for w_name, w in windows.items():
+            for q in w.get("questions", []):
+                if q.get("type") in ("word", "word-exam"):
+                    word = q.get("word") or q.get("hiragana")
+                    if word:
+                        introduced.add(word)
+            for r in w.get("questionResults", []):
+                if r.get("type") not in ("word", "word-exam"):
+                    continue
+                word = r.get("word") or r.get("correctKana")
+                if not word:
+                    continue
+                day_entry["examResults"][word] = {
+                    "isCorrect": bool(r.get("isCorrect")),
+                    "userAnswer": r.get("userAnswer", ""),
+                    "correctAnswer": r.get("correctAnswer", ""),
+                    "questionId": r.get("questionId", ""),
+                }
+                if r.get("isCorrect"):
+                    mastered.add(word)
+                    wrong.pop(word, None)
+                else:
+                    item = wrong.setdefault(word, {
+                        "hiragana": word,
+                        "romaji": r.get("romaji", ""),
+                        "meaning": r.get("meaning", ""),
+                        "emoji": r.get("emoji", ""),
+                        "wrongCount": 0,
+                    })
+                    item["wrongCount"] += 1
+
+        day_entry["learned"] = sorted(learned_today)
+
+    return {
+        "wordIntroduced": sorted(introduced),
+        "wordMastered": sorted(mastered),
+        "wordMasteredCount": len(mastered),
+        "wordWrongList": sorted(wrong.values(), key=lambda x: x.get("wrongCount", 1), reverse=True),
+        "wordMasteredByDay": by_day,
+    }
 
 def generate_learning_profile(progress, kana_stats, all_kana, daily_dir):
     """生成 learning-profile.md"""
@@ -264,7 +336,7 @@ def generate_learning_profile(progress, kana_stats, all_kana, daily_dir):
             if "windows" in daily:
                 total_accuracy = daily.get("totalAccuracy", 0)
                 all_results = []
-                for w_name in ["morning", "afternoon", "evening"]:
+                for w_name in ["morning", "afternoon", "evening", "exam"]:
                     w = daily.get("windows", {}).get(w_name, {})
                     all_results.extend(w.get("questionResults", []))
                 accuracy = total_accuracy
@@ -370,6 +442,11 @@ def main():
     print("正在分析每日答题详情...")
     kana_stats = analyze_daily_records(daily_dir, all_kana)
     print(f"✅ 已分析 {len([k for k, v in kana_stats.items() if v['attempts'] > 0])} 个考过的假名")
+
+    word_stats = analyze_word_records(daily_dir)
+    progress.update(word_stats)
+    progress.setdefault("wordStudyIndex", len(progress.get("wordIntroduced", [])))
+    print(f"✅ 已分析 {len(progress.get('wordIntroduced', []))} 个学过的单词")
 
     # 5.5 生成已学假名复习列表（用于每日摘要）
     mastered_raw = progress.get('mastered', [])

@@ -8,7 +8,7 @@
 
 ## 概述
 
-一套集成在 OpenClaw 中的日语学习系统。当前已从纯五十音升级为「五十音 + 单词混排」：46 个基础假名完成后，推送自动切换到单词识读题，用高频纯平假名单词继续巩固假名读音。
+一套集成在 OpenClaw 中的日语学习系统。当前为 v3.0「先学后考」：46 个基础假名完成后，白天推送新词教学，晚间统一做单词 recall 测验。
 
 ---
 
@@ -16,19 +16,20 @@
 
 ### 1. 自动推送
 - 每 30 分钟心跳检查当前时间窗口
-- 每天 3 个窗口：早间、午间、晚间
+- 每天 4 个窗口：早间学习、午后学习、晚间学习、晚间测验
 - 五十音完成前：假名题
-- 五十音完成后：单词题，每窗口目标为 2 新词 + 1 旧词复习 + 1 错题复习
+- 五十音完成后：白天 3 次各学 2 个新词，不出题；22 点后测 6 个新词 + 复习/错题
 
-### 2. 单词识读题
-- 展示平假名单词，选择对应罗马音
-- 选项同时包含中文释义和 emoji
-- 题目保存为 `type: "word"`，题目 ID 为 `w_YYYYMMDD_window_001`
+### 2. 单词先学后考
+- 学习推送保存为 `type: "study"` / `mode: "word-study"`，只记录 `studyWords`
+- 测验题保存为 `type: "word-exam"`，题目 ID 为 `w_YYYYMMDD_exam_001`
+- 题目随机使用平假名或片假名提问
+- 选项优先来自 `similarGroup`，避免一眼排除
 
 ### 3. 答案验证
 - 推荐传入 `--user-reply`，脚本按 daily 中保存的答案确定性判分
 - 兼容旧的 `--full-message` LLM 解析方式
-- 单词错题写入 `progress.json` 的 `wordWrongList`
+- 单词测验答对写入 `wordMastered`，答错写入 `wordWrongList`
 
 ### 4. 每日沉淀
 - 分析所有历史答题详情
@@ -61,7 +62,7 @@ japanese-learning/
 │   └── select-kana.py      # 假名选择
 └── (数据文件在 workspace/japanese-learning/)
     ├── kana-data.json         # 46 个假名数据
-    ├── word-data.json         # 高频纯平假名单词库
+    ├── word-data.json         # 180 个高频词，含 katakana/similarGroup
     ├── progress.json          # 总体进度
     ├── learning-profile.md    # 个人学习档案
     ├── next-day-plan.json    # 第二天方案
@@ -87,20 +88,26 @@ japanese-learning/
 python3 ~/.openclaw/workspace/skills/japanese-learning/scripts/push-strategy.py
 ```
 
-### 4. 测试单词题生成
+### 4. 测试单词学习生成
 ```bash
 python3 ~/.openclaw/workspace/skills/japanese-learning/scripts/gen-word-questions.py \
-  --new 2 --review 1 --wrong 1 --date 2026-07-06 --window morning
+  --new 2 --date 2026-07-07 --window morning
 ```
 
-### 5. 测试验证
+### 5. 测试单词测验生成
+```bash
+python3 ~/.openclaw/workspace/skills/japanese-learning/scripts/gen-word-questions.py \
+  --exam --words りす,るす,れい,ろく,わたし,あし --review 1 --wrong 1 --date 2026-07-07
+```
+
+### 6. 测试验证
 ```bash
 python3 ~/.openclaw/workspace/skills/japanese-learning/scripts/verify-reply.py \
   --user-reply "1A 2B 3C 4D" \
   --full-message "引用的推送消息..."
 ```
 
-### 6. 查看档案
+### 7. 查看档案
 ```bash
 cat ~/.openclaw/workspace/japanese-learning/learning-profile.md
 ```
@@ -111,7 +118,7 @@ cat ~/.openclaw/workspace/japanese-learning/learning-profile.md
 
 | 时间 | 任务 | 说明 |
 |------|------|------|
-| **每 30 分钟** | 心跳检查 | 落在窗口内推送练习 |
+| **每 30 分钟** | 心跳检查 | 落在窗口内推送学习或测验 |
 | **每天 01:30** | 每日沉淀 | 分析历史、更新学习档案、生成第二天方案 |
 
 ---
@@ -129,18 +136,18 @@ infer-progress.py（分析历史）
 生成 learning-profile.md + next-day-plan.json
    ↓
 （下次心跳）
-push-strategy.py 读取方案
+push-strategy.py 读取方案和 wordStudyIndex
    ↓
-推送新题目（按方案出题）
+白天推学习，晚间推测验
 ```
 
 ---
 
-## 当前状态（2026-07-06）
+## 当前状态（2026-07-07）
 
 - 已掌握：46/46 个基础假名
-- 当前默认进入单词模式
-- 单词库：58 个 2-4 假名的高频纯平假名单词，覆盖全部基础假名
+- 当前默认进入 v3.0 单词先学后考模式
+- 单词库：180 个 2-4 假名为主的高频词，覆盖全部基础假名
 
 ---
 
@@ -156,7 +163,15 @@ push-strategy.py 读取方案
 
 ## 更新日志
 
-### 2026-07-06 — 📖 从五十音模式升级为单词模式
+### 2026-07-07 — v3.0 先学后考
+- 白天 3 个学习窗口各推 2 个新词，只展示教学
+- 22 点后生成晚间 `word-exam` 测验
+- 单词库扩充到 180 词，补齐 `katakana` 和 `similarGroup`
+- `gen-word-questions.py` 支持 `--exam`、`--words`、相似读音干扰项和片假名提问
+- `verify-reply.py`、`infer-progress.py` 兼容 `word-exam` 和学习窗口记录
+- progress 新增/维护 `wordStudyIndex`、`wordMasteredByDay`
+
+### 2026-07-06 — 从五十音模式升级为单词模式
 - **核心变更**：50音全部学完后，推送策略自动切换到「单词模式」
 - 每个窗口：2 个新单词识读题 + 1 个旧词复习 + 1 个错题复习
 - 新增 `word-data.json`（58 个 2-4 假名高频纯平假名单词）
@@ -178,4 +193,4 @@ push-strategy.py 读取方案
 
 ---
 
-*最后更新：2026-07-06*
+*最后更新：2026-07-07*

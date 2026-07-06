@@ -120,7 +120,7 @@ def find_target_file_and_window(config, full_message):
                     if is_new_format(data):
                         # 新格式：查找有未回复窗口的文件
                         windows = data.get("windows", {})
-                        for w_name in ["morning", "afternoon", "evening"]:
+                        for w_name in ["morning", "afternoon", "evening", "exam"]:
                             w = windows.get(w_name, {})
                             if w.get("pushed") and not w.get("replied"):
                                 return file_path, target_date, w_name
@@ -150,7 +150,7 @@ def get_questions_for_verify(today_data, window_name):
             # 未指定窗口，收集所有窗口的题目
             all_qs = []
             windows = today_data.get("windows", {})
-            for w_name in ["morning", "afternoon", "evening"]:
+            for w_name in ["morning", "afternoon", "evening", "exam"]:
                 w = windows.get(w_name, {})
                 all_qs.extend(w.get("questions", []))
             return all_qs, None
@@ -235,7 +235,7 @@ def deterministic_parse_user_reply(user_reply, questions, log_file):
             if 0 <= opt_idx < len(options):
                 selected = options[opt_idx]
 
-        if q_type == "word":
+        if q_type in ("word", "word-exam"):
             option_words = q.get("optionWords", [])
             selected_word = {}
             if len(user_answer) == 1 and user_answer.isalpha():
@@ -458,7 +458,7 @@ def match_reply_to_window(today_data, parsed_question_ids):
         return None
 
     windows = today_data.get("windows", {})
-    for w_name in ["morning", "afternoon", "evening"]:
+    for w_name in ["morning", "afternoon", "evening", "exam"]:
         w = windows.get(w_name, {})
         w_q_ids = {q.get("id") for q in w.get("questions", [])}
         if w_q_ids.intersection(parsed_question_ids):
@@ -486,7 +486,7 @@ def format_output(parsed, questions):
         q_id = r.get("questionId", "")
         # 从 question 列表查找题目详情
         q_detail = qid_to_question.get(q_id, {})
-        if (r.get("type") or q_detail.get("type")) == "word":
+        if (r.get("type") or q_detail.get("type")) in ("word", "word-exam"):
             word = r.get("word") or q_detail.get("word") or q_detail.get("hiragana", "")
             romaji = r.get("romaji") or q_detail.get("romaji", "")
             meaning = r.get("meaning") or q_detail.get("meaning", "")
@@ -569,7 +569,7 @@ def update_window_data(today_data, window_name, parsed):
     if is_new_format(today_data):
         total_correct = 0
         total_questions = 0
-        for w_name in ["morning", "afternoon", "evening"]:
+        for w_name in ["morning", "afternoon", "evening", "exam"]:
             w = today_data["windows"].get(w_name, {})
             total_correct += w.get("correctCount", 0)
             total_questions += len(w.get("questionResults", []))
@@ -588,17 +588,23 @@ def update_mastered_progress(today_data, config, log_file):
         all_questions = []
         all_results = []
         if is_new_format(today_data):
-            for w_name in ["morning", "afternoon", "evening"]:
+            for w_name in ["morning", "afternoon", "evening", "exam"]:
                 w = today_data["windows"].get(w_name, {})
                 all_questions.extend(w.get("questions", []))
                 all_results.extend(w.get("questionResults", []))
+                for sw in w.get("studyWords", []):
+                    if sw.get("hiragana"):
+                        if "wordIntroduced" not in progress:
+                            progress["wordIntroduced"] = []
+                        if sw["hiragana"] not in progress["wordIntroduced"]:
+                            progress["wordIntroduced"].append(sw["hiragana"])
         else:
             all_questions = today_data.get("questions", [])
             all_results = today_data.get("questionResults", [])
 
         # 添加今日学习的假名到 mastered（去重）
         for q in all_questions:
-            if q.get("type") == "word":
+            if q.get("type") in ("word", "word-exam"):
                 continue
             kana = q.get("kana", "")
             if kana and kana not in progress.get("mastered", []):
@@ -616,6 +622,13 @@ def update_mastered_progress(today_data, config, log_file):
         if "wordIntroduced" not in progress:
             progress["wordIntroduced"] = []
 
+        normalized_wrong = []
+        for item in progress.get("wordWrongList", []):
+            if isinstance(item, str):
+                normalized_wrong.append({"hiragana": item, "wrongCount": 1})
+            elif isinstance(item, dict):
+                normalized_wrong.append(item)
+        progress["wordWrongList"] = normalized_wrong
         word_wrong_map = {
             (w.get("hiragana") or w.get("word")): w
             for w in progress.get("wordWrongList", [])
@@ -625,17 +638,23 @@ def update_mastered_progress(today_data, config, log_file):
         word_introduced = set(progress.get("wordIntroduced", []))
 
         for q in all_questions:
-            if q.get("type") == "word":
+            if q.get("type") in ("word", "word-exam"):
                 word_introduced.add(q.get("word") or q.get("hiragana", ""))
 
         for r in all_results:
-            if r.get("type") != "word":
+            if r.get("type") not in ("word", "word-exam"):
                 continue
             word = r.get("word") or r.get("correctKana", "")
             if not word:
                 continue
             if r.get("isCorrect"):
                 word_mastered.add(word)
+                if word in word_wrong_map:
+                    progress["wordWrongList"] = [
+                        item for item in progress.get("wordWrongList", [])
+                        if (item.get("hiragana") or item.get("word")) != word
+                    ]
+                    word_wrong_map.pop(word, None)
             else:
                 existing = word_wrong_map.get(word)
                 if existing:
@@ -656,11 +675,37 @@ def update_mastered_progress(today_data, config, log_file):
         progress["wordMasteredCount"] = len(progress["wordMastered"])
         progress["wordWrongList"].sort(key=lambda x: x.get("wrongCount", 1), reverse=True)
 
+        learned_by_day = progress.setdefault("wordMasteredByDay", {})
+        record_date = today_data.get("date") or datetime.now().strftime("%Y-%m-%d")
+        day_entry = learned_by_day.setdefault(record_date, {"learned": [], "examResults": {}})
+        learned_today = set(day_entry.get("learned", []))
+        if is_new_format(today_data):
+            for w_name in ["morning", "afternoon", "evening"]:
+                for sw in today_data.get("windows", {}).get(w_name, {}).get("studyWords", []):
+                    if sw.get("hiragana"):
+                        learned_today.add(sw["hiragana"])
+        learned_today.update(today_data.get("wordsLearned", []))
+        day_entry["learned"] = sorted([w for w in learned_today if w])
+
+        exam_results = {}
+        for r in all_results:
+            if r.get("type") in ("word", "word-exam"):
+                word = r.get("word") or r.get("correctKana", "")
+                if word:
+                    exam_results[word] = {
+                        "isCorrect": bool(r.get("isCorrect")),
+                        "userAnswer": r.get("userAnswer", ""),
+                        "correctAnswer": r.get("correctAnswer", ""),
+                        "questionId": r.get("questionId", ""),
+                    }
+        if exam_results:
+            day_entry["examResults"] = exam_results
+
         # === 更新错题集（wrongKana）===
         # 收集答错的假名
         wrong_in_window = set()
         for r in all_results:
-            if r.get("type") == "word":
+            if r.get("type") in ("word", "word-exam"):
                 continue
             if not r.get("isCorrect"):
                 hira = r.get("kana") or r.get("kanaHira", "")
@@ -844,7 +889,7 @@ def main():
                 r["romaji"] = q_detail.get("romaji", "")
             if "type" not in r:
                 r["type"] = q_detail.get("type", "hira2kata")
-            if q_detail.get("type") == "word":
+            if q_detail.get("type") in ("word", "word-exam"):
                 r.setdefault("word", q_detail.get("word") or q_detail.get("hiragana", ""))
                 r.setdefault("correctKana", q_detail.get("word") or q_detail.get("hiragana", ""))
                 r.setdefault("meaning", q_detail.get("meaning", ""))
@@ -898,7 +943,7 @@ def main():
     if target_date != today:
         prefix_parts.append(f"📅 回答 {target_date} 的题目")
     if matched_window:
-        window_labels = {"morning": "🌅 早间", "afternoon": "☀️ 午间", "evening": "🌙 晚间"}
+        window_labels = {"morning": "🌅 早间", "afternoon": "☀️ 午间", "evening": "🌙 晚间", "exam": "🎯 测验"}
         prefix_parts.append(f"{window_labels.get(matched_window, matched_window)}推送")
 
     if prefix_parts:

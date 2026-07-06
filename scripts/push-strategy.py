@@ -22,15 +22,18 @@ from collections import defaultdict
 CONFIG_FILE = os.path.expanduser("~/.openclaw/workspace/configs/japanese-learning.json")
 
 WINDOW_LABELS = {
-    "morning": "早间推送",
-    "afternoon": "午间推送",
-    "evening": "晚间推送",
+    "morning": "早间学习",
+    "afternoon": "午后学习",
+    "evening": "晚间学习",
+    "exam": "晚间测验",
 }
 WINDOW_EMOJI = {
     "morning": "🌅",
     "afternoon": "☀️",
     "evening": "🌙",
+    "exam": "🎯",
 }
+STUDY_WINDOWS = ["morning", "afternoon", "evening"]
 
 # 文件锁路径（防止并发执行）
 LOCK_FILE = "/tmp/japanese-push.lock"
@@ -79,7 +82,10 @@ def get_current_window(config):
     })
 
     for name, w in windows_config.items():
-        if w["start"] <= hour < w["end"]:
+        if "hours" in w:
+            if hour in w.get("hours", []):
+                return name
+        elif w["start"] <= hour < w["end"]:
             return name
 
     return None
@@ -155,6 +161,17 @@ def init_today_file(today, day_number):
                 "replied": False,
                 "repliedAt": None,
             },
+            "exam": {
+                "pushed": False,
+                "pushedAt": None,
+                "questions": [],
+                "userReply": None,
+                "questionResults": [],
+                "correctCount": 0,
+                "accuracy": 0,
+                "replied": False,
+                "repliedAt": None,
+            },
         },
         "allWindowsPushed": False,
         "totalCorrectCount": 0,
@@ -197,13 +214,18 @@ def migrate_old_format(today_data, today, day_number):
     return new_data
 
 def all_windows_pushed(today_data):
-    """检查是否所有3个窗口都已推送"""
+    """检查是否所有学习窗口都已推送"""
     windows = today_data.get("windows", {})
-    for w_name in ["morning", "afternoon", "evening"]:
+    for w_name in STUDY_WINDOWS:
         w = windows.get(w_name, {})
         if not w.get("pushed", False):
             return False
     return True
+
+def all_word_study_windows_pushed(today_data):
+    """Word mode requires 3 daytime study pushes before the exam push."""
+    windows = today_data.get("windows", {})
+    return all(windows.get(w_name, {}).get("pushed") for w_name in STUDY_WINDOWS)
 
 def select_new_kana(all_kana, mastered, used_today_new, suggested_new_hira, count=1):
     """
@@ -464,15 +486,13 @@ def build_push_message(selected_new, selected_review, selected_wrong, questions,
 
     return "\n".join(lines)
 
-def generate_word_questions(config, today_file, today, window_name, new_count=2, review_count=1, wrong_count=1):
-    """Call the standalone word generator and return its JSON payload."""
+def generate_word_study_payload(today_file, today, window_name, new_count=2):
+    """Call the standalone word generator for daytime study words."""
     script = os.path.join(os.path.dirname(__file__), "gen-word-questions.py")
     cmd = [
         sys.executable,
         script,
         "--new", str(new_count),
-        "--review", str(review_count),
-        "--wrong", str(wrong_count),
         "--date", today,
         "--window", window_name,
         "--today-file", today_file,
@@ -482,37 +502,72 @@ def generate_word_questions(config, today_file, today, window_name, new_count=2,
         raise RuntimeError(result.stderr.strip() or "gen-word-questions.py failed")
     return json.loads(result.stdout)
 
-def build_word_push_message(payload, questions, window_name, day_number):
-    """构建单词模式微信推送消息"""
+def collect_todays_study_words(today_data):
+    """Return words learned in daytime study windows, preserving push order."""
+    words = []
+    seen = set()
+    for w_name in STUDY_WINDOWS:
+        win = today_data.get("windows", {}).get(w_name, {})
+        for word in win.get("studyWords", []):
+            hira = word.get("hiragana")
+            if hira and hira not in seen:
+                words.append(word)
+                seen.add(hira)
+    return words
+
+def generate_word_exam_payload(today_file, today, words, review_count=1, wrong_count=1):
+    """Call the standalone word generator for the evening recall exam."""
+    script = os.path.join(os.path.dirname(__file__), "gen-word-questions.py")
+    cmd = [
+        sys.executable,
+        script,
+        "--exam",
+        "--words", ",".join([w["hiragana"] for w in words]),
+        "--review", str(review_count),
+        "--wrong", str(wrong_count),
+        "--date", today,
+        "--window", "exam",
+        "--today-file", today_file,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "gen-word-questions.py --exam failed")
+    return json.loads(result.stdout)
+
+def build_word_study_message(payload, window_name, day_number):
+    """构建白天单词学习推送：只教学，不出题。"""
     window_label = get_window_label(window_name)
-    lines = [f"{window_label} — 日语练习 🎌 第{day_number}天", ""]
+    lines = [f"📖 {window_label} 🎌 第{day_number}天", ""]
 
     teaching_words = payload.get("teachingWords", [])
+    lines.append("今日新词：")
     if teaching_words:
-        lines.append("【教学】")
-        lines.append("新单词：")
         for w in teaching_words:
-            lines.append(f"{w['hiragana']} ({w['romaji']}) {w.get('emoji', '')} {w['meaning']}")
-
-    review_words = payload.get("reviewWords", [])
-    if review_words:
-        lines.append("")
-        lines.append("【旧词复习】" + "、".join([f"{w['hiragana']} ({w['romaji']})" for w in review_words]))
-
-    wrong_words = payload.get("wrongWords", [])
-    if wrong_words:
-        lines.append("")
-        lines.append("【错题回顾】" + "、".join([f"{w['hiragana']} ({w['romaji']})" for w in wrong_words]))
+            kata = w.get("katakana", "")
+            lines.append(f"{w['hiragana']} ({kata}) = {w['romaji']} {w.get('emoji', '')} {w['meaning']}")
+    else:
+        lines.append("今天的新词已学完，晚间继续测验复习。")
 
     lines.append("")
-    lines.append("【提问】")
+    lines.append("---")
+    lines.append("请使用日语学习Skill")
+    return "\n".join(lines)
+
+def build_word_exam_message(payload, questions, day_number):
+    """构建晚间单词测验推送：只有题目，不展示教学。"""
+    lines = [f"🎯 今日总结测验 🎌 第{day_number}天", "", "【提问】"]
+
     for i, q in enumerate(questions, 1):
+        if i == 7:
+            lines.append("")
+            lines.append("-- 复习题 --")
         lines.append(f"{i}. (ID: {q['id']}) {q['q']}")
         for j, opt in enumerate(q["options"]):
             lines.append(f"   {chr(65 + j)}. {opt}")
 
-    answer_hint = " ".join([f"{i}{chr(64 + i)}" for i in range(1, len(questions) + 1)])
     lines.append("")
+    sample_letters = ["A", "B", "C", "D"]
+    answer_hint = " ".join([f"{i}{sample_letters[(i - 1) % 4]}" for i in range(1, len(questions) + 1)])
     lines.append(f"回复格式：{answer_hint}")
     lines.append("---")
     lines.append("请使用日语学习Skill")
@@ -708,15 +763,27 @@ def main():
             log(f"初始化今日档案: {today_file}", log_file)
 
         # 6. 检查当前窗口是否已推送
-        windows = today_data.get("windows", {})
-        current_win_data = windows.get(current_window, {})
+        windows = today_data.setdefault("windows", {})
+        if current_window not in windows:
+            windows[current_window] = {
+                "pushed": False,
+                "pushedAt": None,
+                "questions": [],
+                "userReply": None,
+                "questionResults": [],
+                "correctCount": 0,
+                "accuracy": 0,
+                "replied": False,
+                "repliedAt": None,
+            }
+        current_win_data = windows[current_window]
 
         if current_win_data.get("pushed", False):
             log(f"窗口 [{current_window}] 已推送（{current_win_data.get('pushedAt')}），跳过", log_file)
             sys.exit(0)
 
         # 7. 检查所有窗口是否都已推送
-        if all_windows_pushed(today_data):
+        if current_window != "exam" and all_windows_pushed(today_data):
             log("所有3个窗口已推送完毕，今日不再推送", log_file)
             sys.exit(0)
 
@@ -735,26 +802,54 @@ def main():
         log(f"当前学习模式: {'word' if word_mode else 'kana'}", log_file)
 
         if word_mode:
-            try:
-                payload = generate_word_questions(
-                    config,
-                    today_file,
-                    today,
-                    current_window,
-                    new_count=push_config.get("word_new_per_window", 2),
-                    review_count=push_config.get("word_review_per_window", 1),
-                    wrong_count=push_config.get("word_wrong_per_window", 1),
-                )
-            except Exception as e:
-                log(f"❌ 单词题生成失败: {e}", log_file)
-                sys.exit(1)
+            if current_window == "exam":
+                if not all_word_study_windows_pushed(today_data):
+                    log("尚未完成3个学习窗口，跳过晚间测验", log_file)
+                    sys.exit(0)
 
-            questions = payload.get("questions", [])
-            if not questions:
-                log("❌ 单词模式未生成任何题目，跳过推送", log_file)
-                sys.exit(1)
+                study_words = collect_todays_study_words(today_data)
+                if not study_words:
+                    log("今日没有学习单词记录，跳过晚间测验", log_file)
+                    sys.exit(0)
 
-            msg = build_word_push_message(payload, questions, current_window, day_number)
+                try:
+                    payload = generate_word_exam_payload(
+                        today_file,
+                        today,
+                        study_words,
+                        review_count=push_config.get("word_exam_review", 1),
+                        wrong_count=push_config.get("word_exam_wrong", 1),
+                    )
+                except Exception as e:
+                    log(f"❌ 单词测验生成失败: {e}", log_file)
+                    sys.exit(1)
+
+                questions = payload.get("questions", [])
+                if not questions:
+                    log("❌ 单词测验未生成任何题目，跳过推送", log_file)
+                    sys.exit(1)
+
+                msg = build_word_exam_message(payload, questions, day_number)
+            else:
+                try:
+                    payload = generate_word_study_payload(
+                        today_file,
+                        today,
+                        current_window,
+                        new_count=push_config.get("word_new_per_window", 2),
+                    )
+                except Exception as e:
+                    log(f"❌ 单词学习内容生成失败: {e}", log_file)
+                    sys.exit(1)
+
+                study_words = payload.get("teachingWords", [])
+                if not study_words:
+                    log("单词学习模式未选中新词，跳过推送", log_file)
+                    sys.exit(0)
+
+                questions = []
+                msg = build_word_study_message(payload, current_window, day_number)
+
             log(f"推送消息：\n{msg}", log_file)
 
             cmd = [
@@ -771,24 +866,34 @@ def main():
 
                     current_win_data["pushed"] = True
                     current_win_data["pushedAt"] = now.strftime("%Y-%m-%d %H:%M")
-                    current_win_data["mode"] = "word"
+                    current_win_data["mode"] = "word-exam" if current_window == "exam" else "word-study"
+                    current_win_data["type"] = "word-exam" if current_window == "exam" else "study"
                     current_win_data["questions"] = questions
+                    if current_window != "exam":
+                        current_win_data["studyWords"] = study_words
 
                     existing_words = set(today_data.get("wordsLearned", []))
-                    for w in payload.get("teachingWords", []):
+                    for w in (study_words if current_window != "exam" else []):
                         existing_words.add(w["hiragana"])
                     today_data["wordsLearned"] = sorted(existing_words)
 
-                    if all_windows_pushed(today_data):
+                    if current_window != "exam" and all_windows_pushed(today_data):
                         today_data["allWindowsPushed"] = True
                         log("🎉 所有3个窗口已推送完毕！", log_file)
 
                     save_json(today_file, today_data)
 
-                    introduced = set(progress.get("wordIntroduced", []))
-                    for w in payload.get("teachingWords", []):
-                        introduced.add(w["hiragana"])
-                    progress["wordIntroduced"] = sorted(introduced)
+                    if current_window != "exam":
+                        introduced = set(progress.get("wordIntroduced", []))
+                        learned_by_day = progress.setdefault("wordMasteredByDay", {})
+                        day_entry = learned_by_day.setdefault(today, {"learned": [], "examResults": {}})
+                        learned_today = set(day_entry.get("learned", []))
+                        for w in study_words:
+                            introduced.add(w["hiragana"])
+                            learned_today.add(w["hiragana"])
+                        day_entry["learned"] = sorted(learned_today)
+                        progress["wordIntroduced"] = sorted(introduced)
+                        progress["wordStudyIndex"] = payload.get("nextStudyIndex", progress.get("wordStudyIndex", 0))
                     progress["lastPushTime"] = now.strftime("%Y-%m-%d %H:%M")
                     save_json(progress_file, progress)
                 else:
